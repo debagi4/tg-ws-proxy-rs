@@ -22,8 +22,10 @@ src/
   main.rs              Thin CLI wrapper: clap parse, tracing, then server::run
   server.rs            Process-level bind / banner / accept loop (shared by the binary and embedders)
   config.rs            clap-derived Config struct; all CLI flags + TG_* env var fallbacks
-  proxy.rs              Core per-connection logic: client handshake, DC routing, WS/CF/TCP fallback chain
-  socks.rs              Optional Telegram-only SOCKS5 inbound: destination IP → DC map, secretless transports
+  inbound.rs            Inbound layer: `Inbound` trait → `Session`, shared handshake timeout, listeners, client stream
+  inbound/mtproto.rs    MTProto listener: MTProxy-secret handshake, optional inbound FakeTLS
+  inbound/socks.rs      Optional SOCKS5 listener: destination IP → DC map, secretless transports
+  proxy.rs              Routing core fed a `Session`: DC routing, WS/CF/TCP fallback chain, bridges
   crypto.rs             MTProto obfuscated-transport crypto (AES-256-CTR key derivation, secret layout)
   faketls.rs            0xee FakeTLS camouflage: fake TLS 1.3 handshake for inbound + upstream proxies
   splitter.rs            Splits/reassembles MTProto transport frames from WebSocket message boundaries
@@ -132,6 +134,11 @@ requests, so add a rehearsal there when adding one.
 - **Module-level `//!` doc comments explain the *protocol/why*, not the *what*.** Look at the top
   of `crypto.rs`, `faketls.rs`, `splitter.rs`, `pool.rs` for the expected level of detail — they
   describe non-obvious protocol framing/timing reasons, not restate the code.
+- **Listener protocols implement `inbound::Inbound`.** A handshake ends at a `Session` (client
+  stream, DC, framing, client obfuscation) and never builds relay ciphers or routes; bind a
+  `Listener` for it in `server.rs`. Each handler is pinned to 4 KiB of per-connection state by a
+  size test (`proxy/tests.rs`, `tests/socks.rs`): nothing large — ciphers especially — may stay
+  alive across an `.await`.
 - **All outbound TCP connections go through `src/outbound/`.** Direct WS, Cloudflare, Cloudflare
   Worker, TCP fallback, `--check`, and the default-domain fetch all call into the shared outbound
   connector so proxy/NO_PROXY behavior stays consistent. Don't open a raw `TcpStream::connect`

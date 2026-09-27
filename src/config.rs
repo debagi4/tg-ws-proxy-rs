@@ -209,9 +209,9 @@ pub struct Config {
 
     /// Additional SOCKS destination mappings, signed DC:IP (negative DC = media).
     /// These identify client destinations, independently of upstream --dc-ip overrides.
-    #[arg(long, value_parser = crate::socks::parse_dc_mapping,
+    #[arg(long, value_parser = crate::inbound::socks::parse_dc_mapping,
         value_delimiter = ',', allow_hyphen_values = true, env = "TG_SOCKS_DC")]
-    pub socks_dc: Vec<crate::socks::DcMapping>,
+    pub socks_dc: Vec<crate::inbound::socks::DcMapping>,
 
     /// MTProto proxy secret(s) (32 hex chars each).
     /// Can be specified multiple times or as a comma-separated list.

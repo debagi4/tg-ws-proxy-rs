@@ -9,18 +9,18 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use crate::check;
 use crate::config::{Config, UpstreamTier};
 use crate::default_domains;
+use crate::inbound::mtproto::MtProto;
+use crate::inbound::socks::Socks5;
+use crate::inbound::{Listener, Listeners};
 use crate::limits::{auto_max_connections, soft_nofile_limit};
 use crate::pool::WsPool;
-use crate::proxy;
 use crate::runtime::Runtime;
-use crate::socks;
 
 /// Why [`run`] / [`run_with_listen`] stopped before serving, or failed to start.
 #[derive(Debug)]
@@ -197,30 +197,27 @@ pub async fn run_with_listen(
         .parse()
         .map_err(|_| RunError::InvalidListenAddress(format!("{bind_host}:{}", config.port)))?;
 
-    let listener = TcpListener::bind(addr)
+    let listener = Listener::bind(addr, MtProto)
         .await
         .map_err(|source| RunError::Bind { addr, source })?;
     let bound_addr = listener.local_addr().unwrap_or(addr);
     let listen_port = bound_addr.port();
-    let socks_listener = if config.socks_enabled {
+    let mut listeners = vec![listener];
+    let mut socks_addr = None;
+    if config.socks_enabled {
         let addr = SocketAddr::new(config.socks_host, config.socks_port);
-        let listener = TcpListener::bind(addr)
+        let listener = Listener::bind(addr, Socks5)
             .await
             .map_err(|source| RunError::Bind { addr, source })?;
-        info!(
-            "SOCKS5 Telegram listener: {} (no authentication)",
-            listener.local_addr().unwrap_or(addr)
-        );
+        let bound = listener.local_addr().unwrap_or(addr);
+        info!("SOCKS5 Telegram listener: {} (no authentication)", bound);
         if !config.socks_host.is_loopback() {
             warn!("SOCKS5 has no authentication; restrict this listener to trusted LAN clients");
         }
-        Some(listener)
-    } else {
-        None
-    };
-    let socks_addr = socks_listener
-        .as_ref()
-        .and_then(|listener| listener.local_addr().ok());
+        socks_addr = Some(bound);
+        listeners.push(listener);
+    }
+    let mut listeners = Listeners::new(listeners);
 
     // ── FD budget & effective max_connections ────────────────────────────
     // Each active connection uses 2 FDs: the accepted client socket and the
@@ -478,31 +475,18 @@ pub async fn run_with_listen(
                 check_ok = Some(all_ok);
                 break;
             }
-            (accepted, is_socks) = async {
-                match &socks_listener {
-                    Some(socks) => tokio::select! {
-                        accepted = listener.accept() => (accepted, false),
-                        accepted = socks.accept() => (accepted, true),
-                    },
-                    None => (listener.accept().await, false),
-                }
-            } => {
+            (listener, accepted) = listeners.accept() => {
                 match accepted {
-                    Ok((stream, peer_addr)) => {
-                        let cfg = Arc::clone(&config);
-                        let pool = pool.clone();
-                        let runtime = Arc::clone(&runtime);
-                        tokio::spawn(async move {
-                            // Hold the permit for the lifetime of this connection so
-                            // it is released (and the slot freed) when the task ends.
-                            let _permit = permit;
-                            if is_socks {
-                                socks::handle_client(stream, peer_addr, cfg, pool, runtime).await;
-                            } else {
-                                proxy::handle_client_with_runtime(stream, peer_addr, cfg, pool, runtime).await;
-                            }
-                        });
-                    }
+                    // The task holds the permit for the lifetime of the
+                    // connection, so the slot frees when it ends.
+                    Ok((stream, peer_addr)) => listener.spawn(
+                        stream,
+                        peer_addr,
+                        permit,
+                        Arc::clone(&config),
+                        pool.clone(),
+                        Arc::clone(&runtime),
+                    ),
                     Err(e) => {
                         // EMFILE / ENFILE: the process has run out of file descriptors
                         // (e.g. from pool connections).  Back off longer to let

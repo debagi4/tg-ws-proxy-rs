@@ -92,7 +92,7 @@ Example `/etc/forkop/telegram-ws.json` (a **small DC2 test list**, not all Teleg
 
 Select that local file in Forkop's **Rule sets** field. Extend `ip_cidr` to the
 actual DC destinations used by your clients, using the built-in mapping in
-[`src/socks.rs`](../src/socks.rs) or explicit mappings below. Do not infer a DC
+[`src/inbound/socks.rs`](../src/inbound/socks.rs) or explicit mappings below. Do not infer a DC
 from an entire Telegram subnet: different DCs can share a subnet.
 
 If other broad rules also capture router-originated traffic, exclude the bridge's

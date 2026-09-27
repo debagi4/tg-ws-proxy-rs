@@ -10,18 +10,16 @@ use std::collections::VecDeque;
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
+use super::{ClientReader, ClientWriter, Inbound, Reject, Session};
 use crate::config::Config;
-use crate::crypto::{
-    ProtoTag, apply_keystream, build_raw_ciphers, generate_relay_init, make_cipher,
-};
+use crate::crypto::{AesCtr256, ProtoTag, apply_keystream, build_raw_ciphers, make_cipher};
+use crate::inbound;
 use crate::pool::WsPool;
-use crate::proxy::{BridgeCiphers, ClientCipher, InboundTransport, serve_socks_transport};
 use crate::runtime::Runtime;
 
 #[derive(Clone, Debug)]
@@ -223,83 +221,78 @@ async fn negotiate(stream: &mut TcpStream, config: &Config) -> io::Result<i16> {
     Ok(dc)
 }
 
-async fn transport(
+/// Read the MTProto transport header that follows CONNECT: its framing, and
+/// the client's obfuscation as `(decrypt, encrypt)` if it is obfuscated.
+async fn read_transport(
     stream: &mut TcpStream,
-    label: SocketAddr,
-    dc_idx: i16,
-) -> io::Result<InboundTransport> {
+) -> io::Result<(ProtoTag, Option<(AesCtr256, AesCtr256)>)> {
     let mut header = [0; 64];
     stream.read_exact(&mut header[..1]).await?;
-    // Ciphers are only created after the last read: anything alive across an
-    // await is kept in every connection's state machine.
-    let (proto, client_keys) = if header[0] == 0xef {
-        (ProtoTag::Abridged, None)
-    } else {
-        stream.read_exact(&mut header[1..4]).await?;
-        if let Some(proto) = ProtoTag::from_bytes(&header[..4]) {
-            (proto, None)
-        } else {
-            stream.read_exact(&mut header[4..]).await?;
-            let mut decrypted = header;
-            apply_keystream(
-                &mut make_cipher(&header[8..40], &header[40..56]),
-                &mut decrypted,
-            );
-            let proto = ProtoTag::from_bytes(&decrypted[56..60]).ok_or_else(|| {
-                invalid("unsupported MTProto transport (HTTP, Full and FakeTLS are not supported)")
-            })?;
-            // Without an MTProxy secret the header's DC bytes are not a
-            // reliable routing source. The SOCKS destination is authoritative.
-            (proto, Some(build_raw_ciphers(&header)))
-        }
-    };
-    let relay_init = generate_relay_init(proto, dc_idx);
-    let (tg_enc, tg_dec) = build_raw_ciphers(&relay_init);
-    let (clt_dec, clt_enc) = match client_keys {
-        Some((dec, enc)) => (ClientCipher(Some(dec)), ClientCipher(Some(enc))),
-        None => (ClientCipher(None), ClientCipher(None)),
-    };
-    Ok(InboundTransport {
-        label,
-        dc_idx,
-        proto,
-        relay_init,
-        ciphers: BridgeCiphers {
-            clt_dec,
-            clt_enc,
-            tg_enc,
-            tg_dec,
-        },
-    })
+    if header[0] == 0xef {
+        return Ok((ProtoTag::Abridged, None));
+    }
+    stream.read_exact(&mut header[1..4]).await?;
+    if let Some(proto) = ProtoTag::from_bytes(&header[..4]) {
+        return Ok((proto, None));
+    }
+    stream.read_exact(&mut header[4..]).await?;
+    let mut decrypted = header;
+    apply_keystream(
+        &mut make_cipher(&header[8..40], &header[40..56]),
+        &mut decrypted,
+    );
+    let proto = ProtoTag::from_bytes(&decrypted[56..60]).ok_or_else(|| {
+        invalid("unsupported MTProto transport (HTTP, Full and FakeTLS are not supported)")
+    })?;
+    // Without an MTProxy secret the header's DC bytes are not a reliable
+    // routing source. The SOCKS destination is authoritative.
+    Ok((proto, Some(build_raw_ciphers(&header))))
 }
 
+fn rejected(peer: SocketAddr, error: io::Error) -> Reject {
+    debug!("[{}] SOCKS handshake rejected: {}", peer, error);
+    Reject::Close
+}
+
+/// The SOCKS5 listener (`--socks-enabled`).
+pub(crate) struct Socks5;
+
+impl Inbound for Socks5 {
+    const NAME: &'static str = "SOCKS5";
+
+    async fn handshake(
+        &self,
+        mut stream: TcpStream,
+        peer: SocketAddr,
+        config: &Config,
+    ) -> Result<Session, Reject> {
+        let dc_idx = negotiate(&mut stream, config)
+            .await
+            .map_err(|error| rejected(peer, error))?;
+        let (proto, obfuscation) = read_transport(&mut stream)
+            .await
+            .map_err(|error| rejected(peer, error))?;
+        let (reader, writer) = stream.into_split();
+        Ok(Session {
+            reader: ClientReader::Plain(reader),
+            writer: ClientWriter::Plain(writer),
+            dc_idx,
+            proto,
+            obfuscation,
+        })
+    }
+}
+
+/// Serve one SOCKS5 client end-to-end: the SOCKS counterpart of
+/// [`crate::proxy::handle_client_with_runtime`].
 pub async fn handle_client(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
     config: Arc<Config>,
     pool: Arc<WsPool>,
     runtime: Arc<Runtime>,
 ) {
-    let _ = stream.set_nodelay(true);
-    // Matched as a temporary, not bound: a named result would be kept for the
-    // whole session, ciphers included, after `inbound` moves out of it.
-    let inbound = match tokio::time::timeout(Duration::from_secs(config.handshake_timeout), async {
-        let dc = negotiate(&mut stream, &config).await?;
-        transport(&mut stream, peer, dc).await
-    })
-    .await
-    {
-        Ok(Ok(inbound)) => inbound,
-        Ok(Err(error)) => {
-            debug!("[{}] SOCKS handshake rejected: {}", peer, error);
-            return;
-        }
-        Err(_) => {
-            debug!("[{}] SOCKS handshake timeout", peer);
-            return;
-        }
-    };
-    serve_socks_transport(stream, config, pool, runtime, inbound).await;
+    inbound::serve(&Socks5, stream, peer, config, pool, runtime).await;
 }
 
 #[cfg(test)]

@@ -363,7 +363,28 @@ pub fn build_connection_ciphers(
     secret: &[u8],
     relay_init: &[u8; HANDSHAKE_LEN],
 ) -> ConnectionCiphers {
-    // ── Client-side ciphers ────────────────────────────────────────────────
+    let (clt_dec, clt_enc) = build_client_ciphers(prekey_and_iv, secret);
+
+    // The relay uses RAW keys (no secret hash) — Telegram knows the keys
+    // directly from the bytes embedded in the relay init packet.
+    let (tg_enc, tg_dec) = build_raw_ciphers(relay_init);
+
+    ConnectionCiphers {
+        clt_dec,
+        clt_enc,
+        tg_enc,
+        tg_dec,
+    }
+}
+
+/// Build the client-side `(clt_dec, clt_enc)` pair of an MTProxy handshake.
+///
+/// `prekey_and_iv` is `handshake[8..56]` — the raw (unencrypted) prekey+IV
+/// that the client embedded in the init packet.
+pub fn build_client_ciphers(
+    prekey_and_iv: &[u8; PREKEY_LEN + IV_LEN],
+    secret: &[u8],
+) -> (AesCtr256, AesCtr256) {
     // Decryption key = SHA-256(client_prekey ∥ secret)
     let clt_dec_key = {
         let mut h = Sha256::new();
@@ -388,20 +409,9 @@ pub fn build_connection_ciphers(
 
     // Fast-forward the client decryptor past the 64-byte handshake the client
     // already sent.  The CTR keystream used there must not be reused.
-    let mut dummy = [0u8; HANDSHAKE_LEN];
-    clt_dec.apply_keystream(&mut dummy);
+    clt_dec.apply_keystream(&mut [0u8; HANDSHAKE_LEN]);
 
-    // ── Relay-side ciphers ─────────────────────────────────────────────────
-    // The relay uses RAW keys (no secret hash) — Telegram knows the keys
-    // directly from the bytes embedded in the relay init packet.
-    let (tg_enc, tg_dec) = build_raw_ciphers(relay_init);
-
-    ConnectionCiphers {
-        clt_dec,
-        clt_enc,
-        tg_enc,
-        tg_dec,
-    }
+    (clt_dec, clt_enc)
 }
 
 /// Build the two ciphers of an init packet keyed without a proxy secret:
