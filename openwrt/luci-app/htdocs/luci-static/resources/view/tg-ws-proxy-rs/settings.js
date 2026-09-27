@@ -258,7 +258,7 @@ return view.extend({
 		o.depends('socks_enabled', '1');
 		o.rmempty = false;
 		o = s.taboption('general', form.DynamicList, 'socks_dc', _('SOCKS5 destination DC mappings'),
-			_('Optional signed DC:IP entries for destinations missing from the built-in map, e.g. -2:149.154.167.222 for DC2 media. These do not change upstream DC overrides.'));
+			_('Optional signed DC:IP entries for client destinations missing from the built-in map; a negative DC marks a media address, e.g. -2:203.0.113.10 for DC2 media. These do not change upstream DC overrides.'));
 		o.depends('socks_enabled', '1');
 		o.validate = function(sectionId, value) {
 			if (!value) return true;

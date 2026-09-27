@@ -36,7 +36,6 @@ Two things worth setting explicitly in a container:
 For the optional SOCKS5 listener and transparent routing with Forkop, see
 [SOCKS5 and Forkop](Forkop.md) ([на русском](Forkop.ru.md)).
 
-
 Run the proxy on your router without `--host` (or with `--host 0.0.0.0`) so it
 accepts connections from all LAN devices:
 

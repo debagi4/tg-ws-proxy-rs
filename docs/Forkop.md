@@ -6,17 +6,17 @@ The optional SOCKS5 listener lets a local router service send Telegram **TCP
 MTProto** connections into the existing WebSocket bridge. It runs alongside the
 MTProto/FakeTLS listener, sharing the pool, connection limit, outbound connector
 and configured fallback ladder. It does not create a TUN/netifd interface.
+Any router service that can send selected TCP traffic to a SOCKS5 outbound can
+use it; the steps below use Forkop, a sing-box-based OpenWrt routing service.
 
 ```text
 Telegram (no app proxy) → Forkop / sing-box → 127.0.0.1:1080 SOCKS5
                                             → existing WSS / CF / fallback ladder
 ```
 
-Use a binary **and LuCI package built from this branch/version**. An older
-installed binary does not acquire SOCKS support by editing UCI. See
-[Building](Building.md) and `openwrt/build-luci-package.sh`; an ordinary macOS
-build is not a router binary. For Cudy TR3000 use the Linux ARM64 musl target.
-Upstream's installer installs upstream releases, not an unpublished local branch.
+SOCKS input needs **v2.4.6 or newer**, for both the binary and the LuCI package;
+the [one-line installer](../README.md#quick-install-one-liner) upgrades them
+together. Editing UCI on an older installation does not add SOCKS support.
 
 ## Enable on OpenWrt
 
@@ -103,15 +103,18 @@ A source-restricted test section avoids a loop without changing firewall marks.
 The SOCKS request must contain the **real Telegram destination IP**, not a FakeIP
 or hostname. For domain-based routing resolve to a real IP before sending to SOCKS
 (Forkop has **Resolve real IP for routing**), and verify the resulting request.
-Do not change unrelated DNS settings or corporate VPN settings for this feature.
+Unrelated DNS and VPN settings do not need to change for this feature.
 
 ## Destination mapping and limitations
 
-Built-in exact IPv4 mappings cover common DC1–5 and DC203 endpoints. Additional
-IPv4/IPv6 destinations can be configured in **SOCKS5 destination DC mappings**:
+Built-in exact mappings cover common IPv4 DC1–5 and DC203 endpoints, media
+included, and the IPv6 DC1–5 addresses the official clients ship with. Other
+destinations, IPv6 media addresses among them, can be configured in **SOCKS5
+destination DC mappings**:
 
 ```sh
-uci add_list tg-ws-proxy-rs.main.socks_dc='-2:149.154.167.222'
+# Example only: marks 203.0.113.10 as a DC2 media address.
+uci add_list tg-ws-proxy-rs.main.socks_dc='-2:203.0.113.10'
 uci commit tg-ws-proxy-rs
 /etc/init.d/tg-ws-proxy-rs restart
 ```
@@ -120,7 +123,9 @@ A negative DC means a media connection. Explicit mappings override the built-in
 map; the last mapping for an IP wins. They identify **client destinations**, unlike
 `--dc-ip`, which changes **upstream** targets. Only add a mapping when you know the
 correct DC; guessing can break authorization or media. Unknown destinations are
-rejected with a log entry; there is no generic direct proxy fallback for them.
+rejected, with no generic direct proxy fallback. The first attempt for each such
+address is logged as a warning, and repeats at debug level, since Telegram retries
+a refused DC every few seconds.
 
 Supported: SOCKS5 no-auth CONNECT, IPv4/IPv6 addresses (including IP literals encoded
 as SOCKS DOMAIN), destination ports 80/443/5222, MTProto abridged/intermediate/padded
@@ -129,7 +134,7 @@ remains encrypted end-to-end; transport obfuscation is not message encryption.
 
 Not supported: SOCKS UDP ASSOCIATE/BIND, arbitrary DNS names/web browsing,
 MTProto Full/HTTP transport, inbound FakeTLS or MTProxy-secret traffic on the SOCKS
-port. Calls are not provided by this TCP bridge. IPv6 needs explicit mappings.
+port. Calls are not provided by this TCP bridge.
 
 SOCKS CONNECT is acknowledged after destination validation, before MTProto/WSS
 negotiation, because Telegram waits for that acknowledgement before sending its
@@ -142,6 +147,7 @@ SOCKS reply alone therefore does not prove that Telegram or WSS works.
 - Proxy logs must show the selected WS/CF route and transferred bytes. A successful
   app session using `TCP fallback` does not prove that the WSS route works.
 - `has no DC mapping`: check the **real destination IP**, then add its known DC mapping.
+  Each address is warned about once; enable debug logs to see every attempt.
 - `unsupported MTProto transport`: enable debug logs; confirm the app proxy is off
   and that the traffic is native MTProto, not HTTPS/MTProxy or a call.
 - Connection storm/zero data: inspect the device filter and outbound exclusions for
@@ -157,7 +163,3 @@ OpenWrt configuration backups normally include `/etc/config/tg-ws-proxy-rs` and
 `/etc/config/forkop`. Include `/etc/forkop/telegram-ws.json` if using the example;
 `/etc/forkop/` already covers it. A configuration backup does not reinstall binaries
 and package dependencies: retain the matching build separately.
-
-Protocol round trips, shared listener behavior and OpenWrt config mapping are
-covered by automated tests. Real Telegram clients and transparent routing on a
-physical OpenWrt/Forkop router still need an end-to-end field test.
