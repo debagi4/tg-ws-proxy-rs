@@ -229,3 +229,50 @@ async fn socks_bind_failure_is_reported_before_ready_callback() {
     .await;
     assert!(matches!(result, Err(server::RunError::Bind { .. })));
 }
+
+#[test]
+fn connection_links_describe_every_enabled_listener_without_binding() {
+    let secret = "00112233445566778899aabbccddeeff";
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "1443",
+        "--link-ip",
+        "192.168.1.1",
+        "--secret",
+        &format!("{secret},ffeeddccbbaa99887766554433221100"),
+        "--socks-enabled",
+        "--socks-host",
+        "0.0.0.0",
+        "--socks-port",
+        "1081",
+    ])
+    .unwrap();
+    assert_eq!(
+        server::connection_links(&config).unwrap(),
+        [
+            format!("MTProto\tTelegram\ttg://proxy?server=192.168.1.1&port=1443&secret=dd{secret}"),
+            "MTProto\tTelegram\ttg://proxy?server=192.168.1.1&port=1443\
+             &secret=ddffeeddccbbaa99887766554433221100"
+                .to_string(),
+            "SOCKS5\tRouter service\tsocks5://127.0.0.1:1081".to_string(),
+            "SOCKS5\tTelegram\ttg://socks?server=192.168.1.1&port=1081".to_string(),
+        ]
+    );
+
+    // No other device can reach a loopback SOCKS listener, so no tg:// link.
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--host",
+        "0.0.0.0",
+        "--secret",
+        secret,
+        "--socks-enabled",
+    ])
+    .unwrap();
+    let links = server::connection_links(&config).unwrap();
+    assert_eq!(links.len(), 2, "{links:?}");
+    assert_eq!(links[1], "SOCKS5\tRouter service\tsocks5://127.0.0.1:1080");
+}

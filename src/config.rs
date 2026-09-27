@@ -626,6 +626,12 @@ pub struct Config {
     #[arg(long = "check-listener", env = "TG_CHECK_LISTENER")]
     pub check_listener: bool,
 
+    /// Print every enabled listener's connection links and exit, binding
+    /// nothing: one `inbound<TAB>label<TAB>url` line each, for a UI such as
+    /// LuCI to offer them for copying.
+    #[arg(long = "print-links", env = "TG_PRINT_LINKS")]
+    pub print_links: bool,
+
     /// Use the default Cloudflare-proxy domain list from the upstream repository.
     ///
     /// When set, the proxy fetches an obfuscated list of working CF proxy

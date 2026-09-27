@@ -15,9 +15,8 @@ use tracing::{error, info, warn};
 use crate::check;
 use crate::config::{Config, UpstreamTier};
 use crate::default_domains;
-use crate::inbound::mtproto::MtProto;
 use crate::inbound::socks::Socks5;
-use crate::inbound::{Listener, Listeners};
+use crate::inbound::{self, Inbound, Listeners};
 use crate::limits::{auto_max_connections, soft_nofile_limit};
 use crate::pool::WsPool;
 use crate::runtime::Runtime;
@@ -78,6 +77,18 @@ pub struct ListenInfo {
 /// test harness already installed a provider.
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// Every enabled listener's connection links for `config`, one
+/// `inbound<TAB>label<TAB>url` line each: what `--print-links` prints. Nothing
+/// is bound, so the links use the configured ports.
+pub fn connection_links(config: &Config) -> Result<Vec<String>, RunError> {
+    Ok(inbound::planned(config)
+        .map_err(RunError::InvalidListenAddress)?
+        .iter()
+        .flat_map(|plan| plan.links(config))
+        .map(|link| format!("{}\t{}\t{}", link.inbound, link.label, link.url))
+        .collect())
 }
 
 /// Run the proxy until `shutdown` completes.
@@ -193,29 +204,34 @@ pub async fn run_with_listen(
 
     // ── Bind the server socket ────────────────────────────────────────────
     let bind_host = config.bind_host();
-    let addr: SocketAddr = format!("{}:{}", bind_host, config.port)
-        .parse()
-        .map_err(|_| RunError::InvalidListenAddress(format!("{bind_host}:{}", config.port)))?;
-
-    let listener = Listener::bind(addr, MtProto)
-        .await
-        .map_err(|source| RunError::Bind { addr, source })?;
-    let bound_addr = listener.local_addr().unwrap_or(addr);
+    let mut listeners = Vec::new();
+    for plan in inbound::planned(&config).map_err(RunError::InvalidListenAddress)? {
+        let addr = plan.addr;
+        listeners.push(
+            plan.bind()
+                .await
+                .map_err(|source| RunError::Bind { addr, source })?,
+        );
+    }
+    // `planned` puts MTProto first.
+    let bound_addr = listeners[0].addr();
     let listen_port = bound_addr.port();
-    let mut listeners = vec![listener];
+    let mtproto_links = listeners[0].links(&config);
     let mut socks_addr = None;
-    if config.socks_enabled {
-        let addr = SocketAddr::new(config.socks_host, config.socks_port);
-        let listener = Listener::bind(addr, Socks5)
-            .await
-            .map_err(|source| RunError::Bind { addr, source })?;
-        let bound = listener.local_addr().unwrap_or(addr);
-        info!("SOCKS5 Telegram listener: {} (no authentication)", bound);
-        if !config.socks_host.is_loopback() {
-            warn!("SOCKS5 has no authentication; restrict this listener to trusted LAN clients");
+    for listener in &listeners[1..] {
+        let bound = listener.addr();
+        info!("{} Telegram listener: {}", listener.name(), bound);
+        for link in listener.links(&config) {
+            info!("  {}: {}", link.label, link.url);
         }
-        socks_addr = Some(bound);
-        listeners.push(listener);
+        if listener.name() == Socks5::NAME {
+            if !bound.ip().is_loopback() {
+                warn!(
+                    "SOCKS5 has no authentication; restrict this listener to trusted LAN clients"
+                );
+            }
+            socks_addr = Some(bound);
+        }
     }
     let mut listeners = Listeners::new(listeners);
 
@@ -248,12 +264,10 @@ pub async fn run_with_listen(
     let secret = config.primary_secret();
 
     let link_host = config.link_host();
-    let tg_link = format!(
-        "tg://proxy?server={}&port={}&secret={}",
-        link_host,
-        listen_port,
-        config.link_secret()
-    );
+    let (tg_link, extra_links) = match mtproto_links.split_first() {
+        Some((first, rest)) => (first.url.clone(), rest),
+        None => (String::new(), &[][..]),
+    };
 
     info!("{}", "=".repeat(60));
     info!(
@@ -373,14 +387,10 @@ pub async fn run_with_listen(
     info!("{}", "=".repeat(60));
     info!("  Telegram proxy link (use this on all devices):");
     info!("    {}", tg_link);
-    if config.secrets.len() > 1 {
+    if !extra_links.is_empty() {
         info!("  Additional per-user proxy links:");
-        for secret in &config.secrets[1..] {
-            let link_secret = config.link_secret_for(secret);
-            info!(
-                "    tg://proxy?server={}&port={}&secret={}",
-                link_host, listen_port, link_secret
-            );
+        for link in extra_links {
+            info!("    {}", link.url);
         }
     }
 

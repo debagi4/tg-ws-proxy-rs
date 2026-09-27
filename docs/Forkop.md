@@ -34,7 +34,10 @@ uci commit tg-ws-proxy-rs
 logread -e tg-ws-proxy-rs
 ```
 
-Look for `SOCKS5 Telegram listener: 127.0.0.1:1080`. A bind failure (for example,
+Look for `SOCKS5 Telegram listener: 127.0.0.1:1080`. The page's **Connection
+links** block lists every listener's links with a **Copy** button: the
+`socks5://` URL for Forkop and, when SOCKS is bound beyond loopback, a
+`tg://socks` link for Telegram apps. A bind failure (for example,
 port already in use) fails service startup rather than pretending SOCKS is ready.
 Both listeners share the same service enable/autostart setting.
 

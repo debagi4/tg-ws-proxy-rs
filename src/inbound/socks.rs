@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
-use super::{ClientReader, ClientWriter, Inbound, Reject, Session};
+use super::{ClientReader, ClientWriter, Inbound, Link, Reject, Session};
 use crate::config::Config;
 use crate::crypto::{AesCtr256, ProtoTag, apply_keystream, build_raw_ciphers, make_cipher};
 use crate::inbound;
@@ -294,6 +294,35 @@ impl Inbound for Socks5 {
             proto,
             obfuscation,
         })
+    }
+
+    /// A `socks5://` URL for a routing service on this machine, and — unless
+    /// bound to loopback, which no other device can reach — a `tg://socks`
+    /// link for Telegram apps on the network.
+    fn links(&self, addr: SocketAddr, config: &Config) -> Vec<Link> {
+        let local = if addr.ip().is_unspecified() {
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), addr.port())
+        } else {
+            addr
+        };
+        let mut links = vec![Link {
+            inbound: Self::NAME,
+            label: "Router service",
+            url: format!("socks5://{local}"),
+        }];
+        if !addr.ip().is_loopback() {
+            let host = if addr.ip().is_unspecified() {
+                config.link_host()
+            } else {
+                addr.ip().to_string()
+            };
+            links.push(Link {
+                inbound: Self::NAME,
+                label: "Telegram",
+                url: format!("tg://socks?server={}&port={}", host, addr.port()),
+            });
+        }
+        links
     }
 }
 

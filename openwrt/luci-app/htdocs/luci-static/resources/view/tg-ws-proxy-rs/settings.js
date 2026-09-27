@@ -10,6 +10,7 @@
 'require view';
 
 const SERVICE = 'tg-ws-proxy-rs';
+const BINARY = '/usr/bin/tg-ws-proxy-rs';
 const isReadonlyView = !L.hasViewPermission() || null;
 
 const callServiceList = rpc.declare({
@@ -116,6 +117,76 @@ function addSeconds(section, option, title, description, defaultValue) {
 	return addValue(section, 'timeouts', option, title, description, 'uinteger', null, defaultValue);
 }
 
+function isUnspecified(host) {
+	return host === '0.0.0.0' || host === '::';
+}
+
+function isLoopback(host) {
+	return /^127\./.test(host) || host === '::1';
+}
+
+// `--print-links` arguments for the saved settings: the binary builds the
+// links, so their format lives only in each inbound's `links`.
+function printLinksArgs() {
+	const get = (option, fallback) => uci.get(SERVICE, 'main', option) || fallback;
+	const host = get('host', '0.0.0.0');
+	const args = [ '--print-links', '--host', host, '--port', get('port', '1443'),
+		'--secret', get('secret', '') ];
+	// A wildcard or loopback listener is advertised on the address LuCI was
+	// opened on: on a router the binary's own guess is the uplink address,
+	// which LAN devices are not meant to use.
+	const linkIp = get('link_ip', '') ||
+		((isUnspecified(host) || isLoopback(host)) ? window.location.hostname : '');
+	if (linkIp)
+		args.push('--link-ip', linkIp);
+	const domain = get('listen_faketls_domain', '');
+	if (domain)
+		args.push('--listen-faketls-domain', domain);
+	if (get('socks_enabled', '0') === '1')
+		args.push('--socks-enabled', '--socks-host', get('socks_host', '127.0.0.1'),
+			'--socks-port', get('socks_port', '1080'));
+	return args;
+}
+
+const LINK_PURPOSES = {
+	'Telegram': _('Telegram'),
+	'Router service': _('Router service (Forkop, sing-box)')
+};
+
+// One `inbound<TAB>label<TAB>url` line per link; repeated labels are the
+// per-user secrets of one inbound, numbered from the second.
+function parseLinks(stdout) {
+	const seen = {};
+	return String(stdout || '').split('\n')
+		.map((line) => line.split('\t'))
+		.filter((fields) => fields.length === 3)
+		.map(([ inbound, label, url ]) => {
+			const key = inbound + '\t' + label;
+			seen[key] = (seen[key] || 0) + 1;
+			const purpose = LINK_PURPOSES[label] || label;
+			return {
+				inbound,
+				purpose: seen[key] > 1 ? _('%s, secret %d').format(purpose, seen[key]) : purpose,
+				url
+			};
+		});
+}
+
+function copyText(text) {
+	if (navigator.clipboard && window.isSecureContext)
+		return navigator.clipboard.writeText(text);
+	// LuCI is usually plain HTTP, where the Clipboard API does not exist.
+	const area = E('textarea', { readonly: '', style: 'position:fixed;top:-100px;opacity:0' }, text);
+	document.body.appendChild(area);
+	area.select();
+	let copied = false;
+	try {
+		copied = document.execCommand('copy');
+	} catch (error) {}
+	area.remove();
+	return copied ? Promise.resolve() : Promise.reject(new Error('clipboard unavailable'));
+}
+
 return view.extend({
 	load() {
 		return uci.load(SERVICE);
@@ -174,6 +245,50 @@ return view.extend({
 		]);
 	},
 
+	handleCopy(url, event) {
+		const button = event.currentTarget;
+		return copyText(url).then(() => {
+			button.textContent = _('Copied');
+			window.setTimeout(() => { button.textContent = _('Copy'); }, 1500);
+		}).catch(() => {
+			// Still let the user copy it by hand.
+			window.prompt(_('Copy the link:'), url);
+		});
+	},
+
+	updateLinks() {
+		const node = document.getElementById('tg_ws_proxy_links');
+		if (!node)
+			return Promise.resolve();
+		if (!uci.get(SERVICE, 'main', 'secret')) {
+			dom.content(node, E('em', {}, _('No proxy secret is set yet.')));
+			return Promise.resolve();
+		}
+		return fs.exec(BINARY, printLinksArgs()).then((result) => {
+			if (result.code !== 0)
+				throw new Error((result.stderr || '').trim() || _('exit code %d').format(result.code));
+			dom.content(node, this.linksTable(parseLinks(result.stdout)));
+		}).catch((error) => {
+			dom.content(node, E('em', {}, _('Links are unavailable: %s').format(error.message)));
+		});
+	},
+
+	linksTable(links) {
+		return E('table', { class: 'table' }, links.map((link) => E('tr', { class: 'tr' }, [
+			E('td', { class: 'td left', style: 'white-space:nowrap' }, [
+				E('strong', {}, link.inbound), E('br'), link.purpose
+			]),
+			// Masked like the secret field; the Copy button has the full link.
+			E('td', { class: 'td left', style: 'word-break:break-all' },
+				E('code', {}, link.url.replace(/(secret=)[^&]+/, '$1••••••••'))),
+			E('td', { class: 'td right' }, E('button', {
+				type: 'button',
+				class: 'btn cbi-button cbi-button-action',
+				click: ui.createHandlerFn(this, 'handleCopy', link.url)
+			}, _('Copy')))
+		])));
+	},
+
 	handleServiceAction(action, event) {
 		const button = event.currentTarget;
 		button.disabled = true;
@@ -224,6 +339,16 @@ return view.extend({
 						disabled: isReadonlyView
 					}, _('Stop'))
 				])
+			]);
+		};
+
+		s = m.section(form.TypedSection);
+		s.render = function() {
+			window.setTimeout(() => self.updateLinks(), 0);
+			return E('div', { class: 'cbi-section' }, [
+				E('h3', {}, _('Connection links')),
+				E('div', { id: 'tg_ws_proxy_links' }, _('Collecting data...')),
+				E('div', {}, E('small', {}, _('Built from the saved settings; after changing them, Save & Apply.')))
 			]);
 		};
 

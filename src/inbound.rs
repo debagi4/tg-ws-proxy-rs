@@ -33,6 +33,8 @@ use crate::crypto::{AesCtr256, ProtoTag};
 use crate::faketls::{
     TLS_MAX_RECORD_PAYLOAD, TLS_READ_HEADROOM, read_tls_appdata, write_tls_appdata,
 };
+use crate::inbound::mtproto::MtProto;
+use crate::inbound::socks::Socks5;
 use crate::pool::WsPool;
 use crate::proxy;
 use crate::runtime::Runtime;
@@ -48,6 +50,16 @@ pub(crate) struct Session {
     /// The client's transport obfuscation as `(decrypt, encrypt)`, or `None`
     /// for a plain transport.
     pub(crate) obfuscation: Option<(AesCtr256, AesCtr256)>,
+}
+
+/// A way for a client to reach a listener, as offered to the user to copy.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Link {
+    /// The [`Inbound::NAME`] of the listener it reaches.
+    pub(crate) inbound: &'static str,
+    /// What the link is for, e.g. a Telegram app or a router service.
+    pub(crate) label: &'static str,
+    pub(crate) url: String,
 }
 
 /// How a failed handshake ends the connection.
@@ -75,6 +87,10 @@ pub(crate) trait Inbound: Send + Sync + 'static {
         peer: SocketAddr,
         config: &Config,
     ) -> impl Future<Output = Result<Session, Reject>> + Send;
+
+    /// The links a user copies into a client to reach this listener at
+    /// `addr`.
+    fn links(&self, addr: SocketAddr, config: &Config) -> Vec<Link>;
 }
 
 /// Serve one accepted client of `inbound` for the rest of its life.
@@ -107,22 +123,70 @@ pub(crate) async fn serve<I: Inbound>(
 
 // ─── Listeners ───────────────────────────────────────────────────────────────
 
-/// A bound listener and the protocol it speaks.
-pub(crate) struct Listener {
-    socket: TcpListener,
+/// A listener the configuration enables, not bound yet.
+pub(crate) struct Planned {
+    pub(crate) addr: SocketAddr,
     inbound: Arc<dyn Spawn>,
 }
 
-impl Listener {
-    pub(crate) async fn bind(addr: SocketAddr, inbound: impl Inbound) -> io::Result<Self> {
-        Ok(Self {
-            socket: TcpListener::bind(addr).await?,
+impl Planned {
+    fn new(addr: SocketAddr, inbound: impl Inbound) -> Self {
+        Self {
+            addr,
             inbound: Arc::new(inbound),
-        })
+        }
     }
 
-    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.socket.local_addr()
+    pub(crate) fn links(&self, config: &Config) -> Vec<Link> {
+        self.inbound.links(self.addr, config)
+    }
+
+    pub(crate) async fn bind(self) -> io::Result<Listener> {
+        Ok(Listener {
+            socket: TcpListener::bind(self.addr).await?,
+            planned: self,
+        })
+    }
+}
+
+/// Every listener `config` enables, MTProto first, at its configured address.
+/// The one place a listener protocol is registered: the server binds these
+/// and `--print-links` describes them. `Err` carries the unparsable address.
+pub(crate) fn planned(config: &Config) -> Result<Vec<Planned>, String> {
+    let host = config.bind_host();
+    let mtproto = format!("{}:{}", host, config.port);
+    let mut all = vec![Planned::new(
+        mtproto.parse().map_err(|_| mtproto.clone())?,
+        MtProto,
+    )];
+    if config.socks_enabled {
+        all.push(Planned::new(
+            SocketAddr::new(config.socks_host, config.socks_port),
+            Socks5,
+        ));
+    }
+    Ok(all)
+}
+
+/// A bound listener and the protocol it speaks.
+pub(crate) struct Listener {
+    socket: TcpListener,
+    planned: Planned,
+}
+
+impl Listener {
+    pub(crate) fn name(&self) -> &'static str {
+        self.planned.inbound.name()
+    }
+
+    /// The bound address: the configured one with any port 0 resolved.
+    pub(crate) fn addr(&self) -> SocketAddr {
+        self.socket.local_addr().unwrap_or(self.planned.addr)
+    }
+
+    /// This listener's links, on the address it is actually bound to.
+    pub(crate) fn links(&self, config: &Config) -> Vec<Link> {
+        self.planned.inbound.links(self.addr(), config)
     }
 
     /// Serve an accepted client on its own task, which holds `permit` for
@@ -136,7 +200,7 @@ impl Listener {
         pool: Arc<WsPool>,
         runtime: Arc<Runtime>,
     ) {
-        Arc::clone(&self.inbound).spawn(stream, peer, permit, config, pool, runtime);
+        Arc::clone(&self.planned.inbound).spawn(stream, peer, permit, config, pool, runtime);
     }
 }
 
@@ -144,6 +208,10 @@ impl Listener {
 /// to put behind `dyn`. Spawning inside the generic impl also keeps each
 /// protocol's connection future inline in its task instead of boxed.
 trait Spawn: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    fn links(&self, addr: SocketAddr, config: &Config) -> Vec<Link>;
+
     fn spawn(
         self: Arc<Self>,
         stream: TcpStream,
@@ -156,6 +224,14 @@ trait Spawn: Send + Sync {
 }
 
 impl<I: Inbound> Spawn for I {
+    fn name(&self) -> &'static str {
+        I::NAME
+    }
+
+    fn links(&self, addr: SocketAddr, config: &Config) -> Vec<Link> {
+        Inbound::links(self, addr, config)
+    }
+
     fn spawn(
         self: Arc<Self>,
         stream: TcpStream,
