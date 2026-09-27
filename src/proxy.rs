@@ -90,6 +90,34 @@ const TLS_READ_HEADROOM: usize = 256;
 /// connection.
 const CLIENT_READ_BUF_SIZE: usize = TLS_MAX_RECORD_PAYLOAD + TLS_READ_HEADROOM;
 
+pub(crate) struct ClientCipher(pub(crate) Option<AesCtr256>);
+
+impl ClientCipher {
+    fn apply_keystream(&mut self, data: &mut [u8]) {
+        if let Some(cipher) = &mut self.0 {
+            cipher.apply_keystream(data);
+        }
+    }
+}
+
+pub(crate) struct BridgeCiphers {
+    pub(crate) clt_dec: ClientCipher,
+    pub(crate) clt_enc: ClientCipher,
+    pub(crate) tg_enc: AesCtr256,
+    pub(crate) tg_dec: AesCtr256,
+}
+
+impl From<ConnectionCiphers> for BridgeCiphers {
+    fn from(c: ConnectionCiphers) -> Self {
+        Self {
+            clt_dec: ClientCipher(Some(c.clt_dec)),
+            clt_enc: ClientCipher(Some(c.clt_enc)),
+            tg_enc: c.tg_enc,
+            tg_dec: c.tg_dec,
+        }
+    }
+}
+
 // ─── Failure cooldowns ───────────────────────────────────────────────────────
 
 /// Per-DC cooldown for the direct WebSocket path, keyed by `(dc, is_media)`.
@@ -395,15 +423,75 @@ pub async fn handle_client_with_runtime(
         return;
     };
 
-    let dc_id = info.dc_id;
-    let is_media = info.is_media;
-    let proto = info.proto;
-    let dc_idx: i16 = if is_media {
-        -(dc_id as i16)
+    let dc_idx = if info.is_media {
+        -(info.dc_id as i16)
     } else {
-        dc_id as i16
+        info.dc_id as i16
     };
+    let relay_init = generate_relay_init(info.proto, dc_idx);
+    let ciphers = build_connection_ciphers(&info.prekey_and_iv, secret, &relay_init).into();
+    Box::pin(serve_transport(
+        reader,
+        writer,
+        config,
+        pool,
+        runtime,
+        InboundTransport {
+            label,
+            dc_idx,
+            proto: info.proto,
+            relay_init,
+            ciphers,
+        },
+    ))
+    .await;
+}
 
+pub(crate) struct InboundTransport {
+    pub(crate) label: SocketAddr,
+    pub(crate) dc_idx: i16,
+    pub(crate) proto: ProtoTag,
+    pub(crate) relay_init: [u8; 64],
+    pub(crate) ciphers: BridgeCiphers,
+}
+
+pub(crate) async fn serve_socks_transport(
+    stream: TcpStream,
+    config: Arc<Config>,
+    pool: Arc<WsPool>,
+    runtime: Arc<Runtime>,
+    inbound: InboundTransport,
+) {
+    let (reader, writer) = stream.into_split();
+    serve_transport(
+        ClientReader::Plain(reader),
+        ClientWriter::Plain(writer),
+        config,
+        pool,
+        runtime,
+        inbound,
+    )
+    .await;
+}
+
+async fn serve_transport(
+    reader: ClientReader,
+    writer: ClientWriter,
+    config: Arc<Config>,
+    pool: Arc<WsPool>,
+    runtime: Arc<Runtime>,
+    inbound: InboundTransport,
+) {
+    let InboundTransport {
+        label,
+        dc_idx,
+        proto,
+        relay_init,
+        ciphers,
+    } = inbound;
+    let dc_id = u32::from(dc_idx.unsigned_abs());
+    let is_media = dc_idx < 0;
+    let timeouts = Timeouts::from_config(&config);
     debug!(
         "[{}] handshake ok: DC{}{} proto={:?}",
         label,
@@ -411,12 +499,6 @@ pub async fn handle_client_with_runtime(
         media_tag(is_media),
         proto
     );
-
-    // ── Step 3: generate the relay init packet for the Telegram backend ──
-    let relay_init = generate_relay_init(proto, dc_idx);
-
-    // ── Step 4: build all four AES-256-CTR ciphers ───────────────────────
-    let ciphers = build_connection_ciphers(&info.prekey_and_iv, secret, &relay_init);
 
     // ── Step 5: walk the fallback ladder ─────────────────────────────────
     let route = Route {
@@ -493,7 +575,7 @@ enum Upstream {
 struct BridgeDispatch {
     label: SocketAddr,
     relay_init: [u8; 64],
-    ciphers: ConnectionCiphers,
+    ciphers: BridgeCiphers,
     proto: ProtoTag,
     dc: u32,
     is_media: bool,
@@ -540,7 +622,7 @@ fn bridge_selected(
             },
         )),
         Upstream::Mtproto(conn) => {
-            let ConnectionCiphers {
+            let BridgeCiphers {
                 clt_dec, clt_enc, ..
             } = ciphers;
 
@@ -551,7 +633,7 @@ fn bridge_selected(
                     label,
                     rem_reader: conn.reader,
                     rem_writer: conn.writer,
-                    ciphers: ConnectionCiphers {
+                    ciphers: BridgeCiphers {
                         clt_dec,
                         clt_enc,
                         tg_enc: conn.enc,
@@ -1319,7 +1401,7 @@ struct WsBridgeParams {
     ws: TgWsStream,
     framing: WsFraming,
     relay_init: [u8; 64],
-    ciphers: ConnectionCiphers,
+    ciphers: BridgeCiphers,
     proto: ProtoTag,
     dc: u32,
     is_media: bool,
@@ -1337,7 +1419,7 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
         is_media,
     } = params;
 
-    let ConnectionCiphers {
+    let BridgeCiphers {
         mut clt_dec,
         mut clt_enc,
         mut tg_enc,
@@ -1572,7 +1654,7 @@ struct RelayParams {
     label: SocketAddr,
     rem_reader: TcpReader,
     rem_writer: TcpWriter,
-    ciphers: ConnectionCiphers,
+    ciphers: BridgeCiphers,
     faketls: bool,
     dc: u32,
     is_media: bool,
@@ -1589,7 +1671,7 @@ async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayP
         is_media,
     } = params;
 
-    let ConnectionCiphers {
+    let BridgeCiphers {
         mut clt_dec,
         mut clt_enc,
         mut tg_enc,
@@ -1695,7 +1777,7 @@ struct TcpBridgeParams<'a> {
     label: SocketAddr,
     dst: &'a str,
     relay_init: &'a [u8; 64],
-    ciphers: ConnectionCiphers,
+    ciphers: BridgeCiphers,
     dc: u32,
     is_media: bool,
     connect_timeout: Duration,
@@ -1735,7 +1817,7 @@ async fn bridge_tcp(
         return;
     }
 
-    let ConnectionCiphers {
+    let BridgeCiphers {
         mut clt_dec,
         mut clt_enc,
         mut tg_enc,

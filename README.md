@@ -95,6 +95,18 @@ binary, without the LuCI package. See
 
 Or use the `tg://proxy?...` link that is printed on startup.
 
+## Optional SOCKS5 input / Forkop
+
+Enable `--socks-enabled` (or **Enable SOCKS5 input** in LuCI) to expose a separate
+Telegram-only SOCKS5 listener on `127.0.0.1:1080`. A local routing service can send
+supported Telegram TCP transports through it while existing MTProto clients keep
+using the original listener. WSS, Cloudflare and fallback settings are shared.
+
+See **[SOCKS5 and Forkop setup](docs/Forkop.md)** / **[Настройка Forkop на русском](docs/Forkop.ru.md)**
+for installation, device-scoped routing, loop prevention, DC mappings, testing and
+rollback. This is not a general-purpose SOCKS proxy or a virtual VPN interface;
+UDP calls and arbitrary HTTPS traffic are not supported.
+
 ## OpenWrt installation
 
 ### Requirements

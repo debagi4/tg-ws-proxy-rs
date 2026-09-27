@@ -20,6 +20,7 @@ use crate::limits::{auto_max_connections, soft_nofile_limit};
 use crate::pool::WsPool;
 use crate::proxy;
 use crate::runtime::Runtime;
+use crate::socks;
 
 /// Why [`run`] / [`run_with_listen`] stopped before serving, or failed to start.
 #[derive(Debug)]
@@ -67,6 +68,8 @@ impl std::error::Error for RunError {
 pub struct ListenInfo {
     pub addr: SocketAddr,
     pub tg_link: String,
+    /// The optional SOCKS listener, including the actual port when binding port 0.
+    pub socks_addr: Option<SocketAddr>,
 }
 
 /// Install the rustls `ring` provider if nothing else has yet.
@@ -199,6 +202,25 @@ pub async fn run_with_listen(
         .map_err(|source| RunError::Bind { addr, source })?;
     let bound_addr = listener.local_addr().unwrap_or(addr);
     let listen_port = bound_addr.port();
+    let socks_listener = if config.socks_enabled {
+        let addr = SocketAddr::new(config.socks_host, config.socks_port);
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|source| RunError::Bind { addr, source })?;
+        info!(
+            "SOCKS5 Telegram listener: {} (no authentication)",
+            listener.local_addr().unwrap_or(addr)
+        );
+        if !config.socks_host.is_loopback() {
+            warn!("SOCKS5 has no authentication; restrict this listener to trusted LAN clients");
+        }
+        Some(listener)
+    } else {
+        None
+    };
+    let socks_addr = socks_listener
+        .as_ref()
+        .and_then(|listener| listener.local_addr().ok());
 
     // ── FD budget & effective max_connections ────────────────────────────
     // Each active connection uses 2 FDs: the accepted client socket and the
@@ -384,6 +406,7 @@ pub async fn run_with_listen(
     on_listen(ListenInfo {
         addr: bound_addr,
         tg_link,
+        socks_addr,
     });
 
     // ── Connection pool warm-up ───────────────────────────────────────────
@@ -455,7 +478,15 @@ pub async fn run_with_listen(
                 check_ok = Some(all_ok);
                 break;
             }
-            accepted = listener.accept() => {
+            (accepted, is_socks) = async {
+                match &socks_listener {
+                    Some(socks) => tokio::select! {
+                        accepted = listener.accept() => (accepted, false),
+                        accepted = socks.accept() => (accepted, true),
+                    },
+                    None => (listener.accept().await, false),
+                }
+            } => {
                 match accepted {
                     Ok((stream, peer_addr)) => {
                         let cfg = Arc::clone(&config);
@@ -465,10 +496,11 @@ pub async fn run_with_listen(
                             // Hold the permit for the lifetime of this connection so
                             // it is released (and the slot freed) when the task ends.
                             let _permit = permit;
-                            proxy::handle_client_with_runtime(
-                                stream, peer_addr, cfg, pool, runtime,
-                            )
-                            .await;
+                            if is_socks {
+                                socks::handle_client(stream, peer_addr, cfg, pool, runtime).await;
+                            } else {
+                                proxy::handle_client_with_runtime(stream, peer_addr, cfg, pool, runtime).await;
+                            }
                         });
                     }
                     Err(e) => {

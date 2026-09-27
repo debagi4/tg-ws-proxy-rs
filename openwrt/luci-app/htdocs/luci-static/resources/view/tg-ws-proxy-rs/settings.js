@@ -246,6 +246,27 @@ return view.extend({
 			'port', '1443', '1443');
 		o.rmempty = false;
 
+		o = addFlag(s, 'general', 'socks_enabled', _('Enable SOCKS5 input'),
+			_('Telegram TCP only. Shares the existing WebSocket and fallback settings. No SOCKS authentication.'), '0');
+		o = addValue(s, 'general', 'socks_host', _('SOCKS5 listen address'),
+			_('Keep 127.0.0.1 for Forkop on this router. A LAN address allows trusted devices to connect without a password.'),
+			'ipaddr', '127.0.0.1', '127.0.0.1');
+		o.depends('socks_enabled', '1');
+		o.rmempty = false;
+		o = addValue(s, 'general', 'socks_port', _('SOCKS5 listen port'), null,
+			'port', '1080', '1080');
+		o.depends('socks_enabled', '1');
+		o.rmempty = false;
+		o = s.taboption('general', form.DynamicList, 'socks_dc', _('SOCKS5 destination DC mappings'),
+			_('Optional signed DC:IP entries for destinations missing from the built-in map, e.g. -2:149.154.167.222 for DC2 media. These do not change upstream DC overrides.'));
+		o.depends('socks_enabled', '1');
+		o.validate = function(sectionId, value) {
+			if (!value) return true;
+			const match = value.match(/^(-?(?:[1-5]|203)):(.+)$/);
+			return (match && validateDatatype('ipaddr', match[2], [true]))
+				? true : _('Expecting signed DC:IP (DC 1..5 or 203; negative for media)');
+		};
+
 		o = addValue(s, 'general', 'secret', _('Proxy secrets'),
 			_('Comma-separated proxy secrets stored in UCI. Leave empty once to generate one persistent random secret at service start.'));
 		o.password = true;

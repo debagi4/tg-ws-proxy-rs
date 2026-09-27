@@ -257,7 +257,7 @@ async fn upstream_frame_sizes(framing: WsFraming, payload: &[u8]) -> Vec<usize> 
     let (reader, writer) = server.into_split();
 
     let relay_init = generate_relay_init(ProtoTag::PaddedIntermediate, 2);
-    let ciphers = build_connection_ciphers(&[0u8; 48], &[0u8; 32], &relay_init);
+    let ciphers = build_connection_ciphers(&[0u8; 48], &[0u8; 32], &relay_init).into();
 
     let bridge = tokio::spawn(async move {
         bridge_ws(

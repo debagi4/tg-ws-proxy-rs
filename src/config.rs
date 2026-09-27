@@ -195,6 +195,24 @@ pub struct Config {
     #[arg(long, env = "TG_HOST")]
     pub host: Option<String>,
 
+    /// Enable a separate, unauthenticated Telegram-only SOCKS5 listener.
+    #[arg(long, env = "TG_SOCKS_ENABLED")]
+    pub socks_enabled: bool,
+
+    /// SOCKS5 bind IP. Keep loopback when used by a router's local routing service.
+    #[arg(long, default_value = "127.0.0.1", env = "TG_SOCKS_HOST")]
+    pub socks_host: std::net::IpAddr,
+
+    /// SOCKS5 TCP port (separate from the MTProto listener).
+    #[arg(long, default_value = "1080", env = "TG_SOCKS_PORT")]
+    pub socks_port: u16,
+
+    /// Additional SOCKS destination mappings, signed DC:IP (negative DC = media).
+    /// These identify client destinations, independently of upstream --dc-ip overrides.
+    #[arg(long, value_parser = crate::socks::parse_dc_mapping,
+        value_delimiter = ',', allow_hyphen_values = true, env = "TG_SOCKS_DC")]
+    pub socks_dc: Vec<crate::socks::DcMapping>,
+
     /// MTProto proxy secret(s) (32 hex chars each).
     /// Can be specified multiple times or as a comma-separated list.
     /// A random secret is generated if not provided.
