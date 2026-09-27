@@ -394,23 +394,7 @@ pub fn build_connection_ciphers(
     // ── Relay-side ciphers ─────────────────────────────────────────────────
     // The relay uses RAW keys (no secret hash) — Telegram knows the keys
     // directly from the bytes embedded in the relay init packet.
-    let relay_enc_key = &relay_init[SKIP_LEN..SKIP_LEN + PREKEY_LEN];
-    let relay_enc_iv = &relay_init[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN];
-
-    let relay_prekey_iv_rev: Vec<u8> = relay_init[SKIP_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN]
-        .iter()
-        .rev()
-        .copied()
-        .collect();
-    let relay_dec_key = &relay_prekey_iv_rev[..PREKEY_LEN];
-    let relay_dec_iv = &relay_prekey_iv_rev[PREKEY_LEN..];
-
-    let mut tg_enc = make_cipher(relay_enc_key, relay_enc_iv);
-    let tg_dec = make_cipher(relay_dec_key, relay_dec_iv);
-
-    // Fast-forward the relay encryptor past the 64-byte relay init that we
-    // already sent to Telegram.
-    tg_enc.apply_keystream(&mut dummy);
+    let (tg_enc, tg_dec) = build_raw_ciphers(relay_init);
 
     ConnectionCiphers {
         clt_dec,
@@ -418,4 +402,26 @@ pub fn build_connection_ciphers(
         tg_enc,
         tg_dec,
     }
+}
+
+/// Build the two ciphers of an init packet keyed without a proxy secret:
+/// `(sender, reply)`.
+///
+/// That is our relay init to Telegram, and also what a client sends when it
+/// talks to Telegram directly rather than to an MTProxy. The key and IV are
+/// the raw bytes [8..56], reversed for the reply direction; the sender's
+/// cipher is fast-forwarded past the 64-byte init it already encrypted.
+pub fn build_raw_ciphers(init: &[u8; HANDSHAKE_LEN]) -> (AesCtr256, AesCtr256) {
+    let mut sender = make_cipher(
+        &init[SKIP_LEN..SKIP_LEN + PREKEY_LEN],
+        &init[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN],
+    );
+    sender.apply_keystream(&mut [0u8; HANDSHAKE_LEN]);
+
+    let mut reversed = [0u8; PREKEY_LEN + IV_LEN];
+    reversed.copy_from_slice(&init[SKIP_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN]);
+    reversed.reverse();
+    let reply = make_cipher(&reversed[..PREKEY_LEN], &reversed[PREKEY_LEN..]);
+
+    (sender, reply)
 }

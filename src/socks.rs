@@ -16,7 +16,9 @@ use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 use crate::config::Config;
-use crate::crypto::{ProtoTag, apply_keystream, generate_relay_init, make_cipher};
+use crate::crypto::{
+    ProtoTag, apply_keystream, build_raw_ciphers, generate_relay_init, make_cipher,
+};
 use crate::pool::WsPool;
 use crate::proxy::{BridgeCiphers, ClientCipher, InboundTransport, serve_socks_transport};
 use crate::runtime::Runtime;
@@ -193,38 +195,31 @@ async fn transport(
 ) -> io::Result<InboundTransport> {
     let mut header = [0; 64];
     stream.read_exact(&mut header[..1]).await?;
-    let mut client_keys = None;
-    let proto = if header[0] == 0xef {
-        ProtoTag::Abridged
+    // Ciphers are only created after the last read: anything alive across an
+    // await is kept in every connection's state machine.
+    let (proto, client_keys) = if header[0] == 0xef {
+        (ProtoTag::Abridged, None)
     } else {
         stream.read_exact(&mut header[1..4]).await?;
         if let Some(proto) = ProtoTag::from_bytes(&header[..4]) {
-            proto
+            (proto, None)
         } else {
             stream.read_exact(&mut header[4..]).await?;
             let mut decrypted = header;
-            let mut dec = make_cipher(&header[8..40], &header[40..56]);
-            apply_keystream(&mut dec, &mut decrypted);
+            apply_keystream(
+                &mut make_cipher(&header[8..40], &header[40..56]),
+                &mut decrypted,
+            );
             let proto = ProtoTag::from_bytes(&decrypted[56..60]).ok_or_else(|| {
                 invalid("unsupported MTProto transport (HTTP, Full and FakeTLS are not supported)")
             })?;
-            let mut reversed = [0; 48];
-            reversed.copy_from_slice(&header[8..56]);
-            reversed.reverse();
-            let enc = make_cipher(&reversed[..32], &reversed[32..]);
-            client_keys = Some((dec, enc));
             // Without an MTProxy secret the header's DC bytes are not a
             // reliable routing source. The SOCKS destination is authoritative.
-            proto
+            (proto, Some(build_raw_ciphers(&header)))
         }
     };
     let relay_init = generate_relay_init(proto, dc_idx);
-    let mut tg_enc = make_cipher(&relay_init[8..40], &relay_init[40..56]);
-    apply_keystream(&mut tg_enc, &mut [0; 64]);
-    let mut reversed = [0; 48];
-    reversed.copy_from_slice(&relay_init[8..56]);
-    reversed.reverse();
-    let tg_dec = make_cipher(&reversed[..32], &reversed[32..]);
+    let (tg_enc, tg_dec) = build_raw_ciphers(&relay_init);
     let (clt_dec, clt_enc) = match client_keys {
         Some((dec, enc)) => (ClientCipher(Some(dec)), ClientCipher(Some(enc))),
         None => (ClientCipher(None), ClientCipher(None)),
@@ -251,14 +246,23 @@ pub async fn handle_client(
     runtime: Arc<Runtime>,
 ) {
     let _ = stream.set_nodelay(true);
-    let handshake = tokio::time::timeout(Duration::from_secs(config.handshake_timeout), async {
+    // Matched as a temporary, not bound: a named result would be kept for the
+    // whole session, ciphers included, after `inbound` moves out of it.
+    let inbound = match tokio::time::timeout(Duration::from_secs(config.handshake_timeout), async {
         let dc = negotiate(&mut stream, &config).await?;
         transport(&mut stream, peer, dc).await
     })
-    .await;
-    match handshake {
-        Ok(Ok(inbound)) => serve_socks_transport(stream, config, pool, runtime, inbound).await,
-        Ok(Err(error)) => debug!("[{}] SOCKS handshake rejected: {}", peer, error),
-        Err(_) => debug!("[{}] SOCKS handshake timeout", peer),
-    }
+    .await
+    {
+        Ok(Ok(inbound)) => inbound,
+        Ok(Err(error)) => {
+            debug!("[{}] SOCKS handshake rejected: {}", peer, error);
+            return;
+        }
+        Err(_) => {
+            debug!("[{}] SOCKS handshake timeout", peer);
+            return;
+        }
+    };
+    serve_socks_transport(stream, config, pool, runtime, inbound).await;
 }

@@ -23,6 +23,7 @@ src/
   server.rs            Process-level bind / banner / accept loop (shared by the binary and embedders)
   config.rs            clap-derived Config struct; all CLI flags + TG_* env var fallbacks
   proxy.rs              Core per-connection logic: client handshake, DC routing, WS/CF/TCP fallback chain
+  socks.rs              Optional Telegram-only SOCKS5 inbound: destination IP → DC map, secretless transports
   crypto.rs             MTProto obfuscated-transport crypto (AES-256-CTR key derivation, secret layout)
   faketls.rs            0xee FakeTLS camouflage: fake TLS 1.3 handshake for inbound + upstream proxies
   splitter.rs            Splits/reassembles MTProto transport frames from WebSocket message boundaries
@@ -40,7 +41,7 @@ tests/common/mod.rs      Shared integration fixtures (fake HTTP CONNECT proxy, p
 docs/                    User-facing guides. README stays an overview and links here rather than growing:
                          Fallbacks.md (routing tiers), Building.md (cross-compiling, UPX), Deployment.md
                          (Docker, OpenWrt, env vars), CfProxy.md + CfWorker.md (Cloudflare setup),
-                         Android.md (Compose app + NDK build)
+                         Android.md (Compose app + NDK build), Forkop.md (SOCKS5 inbound + router routing)
 android/                 Jetpack Compose app (Gradle catalog + build-logic convention; see docs/Android.md)
 crates/android-jni/      JNI start/stop + log callback cdylib; built only by the Android Gradle task
 ```

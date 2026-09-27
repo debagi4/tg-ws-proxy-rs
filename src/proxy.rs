@@ -430,7 +430,7 @@ pub async fn handle_client_with_runtime(
     };
     let relay_init = generate_relay_init(info.proto, dc_idx);
     let ciphers = build_connection_ciphers(&info.prekey_and_iv, secret, &relay_init).into();
-    Box::pin(serve_transport(
+    serve_transport(
         reader,
         writer,
         config,
@@ -443,7 +443,7 @@ pub async fn handle_client_with_runtime(
             relay_init,
             ciphers,
         },
-    ))
+    )
     .await;
 }
 
@@ -455,13 +455,13 @@ pub(crate) struct InboundTransport {
     pub(crate) ciphers: BridgeCiphers,
 }
 
-pub(crate) async fn serve_socks_transport(
+pub(crate) fn serve_socks_transport(
     stream: TcpStream,
     config: Arc<Config>,
     pool: Arc<WsPool>,
     runtime: Arc<Runtime>,
     inbound: InboundTransport,
-) {
+) -> impl Future<Output = ()> + Send {
     let (reader, writer) = stream.into_split();
     serve_transport(
         ClientReader::Plain(reader),
@@ -471,89 +471,81 @@ pub(crate) async fn serve_socks_transport(
         runtime,
         inbound,
     )
-    .await;
 }
 
-async fn serve_transport(
+fn serve_transport(
     reader: ClientReader,
     writer: ClientWriter,
     config: Arc<Config>,
     pool: Arc<WsPool>,
     runtime: Arc<Runtime>,
     inbound: InboundTransport,
-) {
-    let InboundTransport {
-        label,
-        dc_idx,
-        proto,
-        relay_init,
-        ciphers,
-    } = inbound;
-    let dc_id = u32::from(dc_idx.unsigned_abs());
-    let is_media = dc_idx < 0;
-    let timeouts = Timeouts::from_config(&config);
-    debug!(
-        "[{}] handshake ok: DC{}{} proto={:?}",
-        label,
-        dc_id,
-        media_tag(is_media),
-        proto
-    );
-
-    // ── Step 5: walk the fallback ladder ─────────────────────────────────
-    let route = Route {
-        label,
-        config: &config,
-        runtime: &runtime,
-        pool: &pool,
-        timeouts,
-        dc: dc_id,
-        is_media,
-        media: media_tag(is_media),
-        dc_idx,
-        proto,
-    };
-    let target_ip = config.dc_target_ip(dc_id);
-
-    // ── Step 6: bridge whatever we ended up connected to ─────────────────
+) -> impl Future<Output = ()> + Send {
     // The routing ladder contains every TLS/WS fallback handshake, while only
     // one bridge branch survives for the session. Box the short-lived ladder,
     // then box only the bridge actually selected; otherwise Rust's async state
-    // machine reserves space for their combined widest variants forever.
-    let bridge = Box::pin(select_bridge(
-        &route,
-        target_ip,
-        reader,
-        writer,
-        BridgeDispatch {
-            label,
-            relay_init,
-            ciphers,
-            proto,
-            dc: dc_id,
-            is_media,
-            tcp_connect_timeout: route.timeouts.tcp_fallback,
-            runtime: Arc::clone(&runtime),
-        },
-    ))
-    .await;
-    if let Some(bridge) = bridge {
-        bridge.await;
+    // machine reserves space for their combined widest variants forever. Not
+    // an `async fn`: its arguments — four ciphers, some 4 KiB — would stay in
+    // the session's state machine after moving into the ladder.
+    let ladder = Box::pin(select_bridge(
+        reader, writer, config, pool, runtime, inbound,
+    ));
+    async move {
+        let bridge = ladder.await;
+        if let Some(bridge) = bridge {
+            bridge.await;
+        }
     }
 }
 
 // ─── Routing ─────────────────────────────────────────────────────────────────
 
 async fn select_bridge(
-    route: &Route<'_>,
-    target_ip: Option<&str>,
     reader: ClientReader,
     writer: ClientWriter,
-    params: BridgeDispatch,
+    config: Arc<Config>,
+    pool: Arc<WsPool>,
+    runtime: Arc<Runtime>,
+    inbound: InboundTransport,
 ) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
-    select_upstream(route, target_ip)
-        .await
-        .map(|upstream| bridge_selected(reader, writer, upstream, params))
+    let dc_id = u32::from(inbound.dc_idx.unsigned_abs());
+    let is_media = inbound.dc_idx < 0;
+    debug!(
+        "[{}] handshake ok: DC{}{} proto={:?}",
+        inbound.label,
+        dc_id,
+        media_tag(is_media),
+        inbound.proto
+    );
+
+    let route = Route {
+        label: inbound.label,
+        config: &config,
+        runtime: &runtime,
+        pool: &pool,
+        timeouts: Timeouts::from_config(&config),
+        dc: dc_id,
+        is_media,
+        media: media_tag(is_media),
+        dc_idx: inbound.dc_idx,
+        proto: inbound.proto,
+    };
+    let upstream = select_upstream(&route, config.dc_target_ip(dc_id)).await?;
+    Some(bridge_selected(
+        reader,
+        writer,
+        upstream,
+        BridgeDispatch {
+            label: inbound.label,
+            relay_init: inbound.relay_init,
+            ciphers: inbound.ciphers,
+            proto: inbound.proto,
+            dc: dc_id,
+            is_media,
+            tcp_connect_timeout: route.timeouts.tcp_fallback,
+            runtime: Arc::clone(&runtime),
+        },
+    ))
 }
 
 /// The upstream a connection was routed to, ready to be bridged.

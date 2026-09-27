@@ -21,7 +21,7 @@ fn config() -> Config {
         .with_defaults()
 }
 
-async fn start(cfg: Config) -> (TcpStream, tokio::task::JoinHandle<()>) {
+async fn handler(cfg: Config) -> (TcpStream, impl Future<Output = ()> + Send) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap())
         .await
@@ -33,14 +33,25 @@ async fn start(cfg: Config) -> (TcpStream, tokio::task::JoinHandle<()>) {
         Duration::from_secs(30),
         runtime.clone(),
     ));
-    let task = tokio::spawn(socks::handle_client(
-        stream,
-        peer,
-        Arc::new(cfg),
-        pool,
-        runtime,
-    ));
-    (client, task)
+    let handler = socks::handle_client(stream, peer, Arc::new(cfg), pool, runtime);
+    (client, handler)
+}
+
+async fn start(cfg: Config) -> (TcpStream, tokio::task::JoinHandle<()>) {
+    let (client, handler) = handler(cfg).await;
+    (client, tokio::spawn(handler))
+}
+
+#[tokio::test]
+async fn client_handler_future_stays_compact() {
+    // Every SOCKS client holds this state for its whole session, so it gets
+    // the same budget as the MTProto listener's handler.
+    let (_client, handler) = handler(config()).await;
+    let future_size = std::mem::size_of_val(&handler);
+    assert!(
+        future_size <= 4 * 1024,
+        "the SOCKS client future grew to {future_size} bytes"
+    );
 }
 
 async fn read<const N: usize>(client: &mut TcpStream) -> [u8; N] {
