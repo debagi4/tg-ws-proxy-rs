@@ -114,7 +114,7 @@ uci commit tg-ws-proxy-rs
 для каждого адреса попадает в лог предупреждением `has no DC mapping`, повторы — только
 на уровне debug, потому что Telegram повторяет подключение каждые несколько секунд.
 
-Поддерживаются SOCKS5 CONNECT на порты 80/443/5222 и MTProto abridged/intermediate/
+Поддерживаются SOCKS5 CONNECT на любой порт (мост сам выбирает путь до DC) и MTProto abridged/intermediate/
 padded intermediate, обычный и обфусцированный без секрета. Не поддерживаются
 SOCKS UDP/BIND, произвольные сайты/доменные имена, MTProto Full/HTTP и MTProxy/FakeTLS
 внутри SOCKS. Звонки через этот TCP-мост не обеспечиваются.

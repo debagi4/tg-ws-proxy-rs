@@ -395,7 +395,8 @@ pub fn build_client_ciphers(
     let clt_dec_iv = &prekey_and_iv[PREKEY_LEN..];
 
     // Encryption uses the *reversed* prekey+IV pair.
-    let reversed: Vec<u8> = prekey_and_iv.iter().rev().copied().collect();
+    let mut reversed = *prekey_and_iv;
+    reversed.reverse();
     let clt_enc_key = {
         let mut h = Sha256::new();
         h.update(&reversed[..PREKEY_LEN]);

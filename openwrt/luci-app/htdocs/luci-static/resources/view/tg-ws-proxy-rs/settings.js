@@ -250,16 +250,19 @@ return view.extend({
 			_('Telegram TCP only. Shares the existing WebSocket and fallback settings. No SOCKS authentication.'), '0');
 		o = addValue(s, 'general', 'socks_host', _('SOCKS5 listen address'),
 			_('Keep 127.0.0.1 for Forkop on this router. A LAN address allows trusted devices to connect without a password.'),
-			'ipaddr', '127.0.0.1', '127.0.0.1');
+			'ipaddr(1)', '127.0.0.1', '127.0.0.1');
 		o.depends('socks_enabled', '1');
+		o.retain = true;
 		o.rmempty = false;
 		o = addValue(s, 'general', 'socks_port', _('SOCKS5 listen port'), null,
 			'port', '1080', '1080');
 		o.depends('socks_enabled', '1');
+		o.retain = true;
 		o.rmempty = false;
 		o = s.taboption('general', form.DynamicList, 'socks_dc', _('SOCKS5 destination DC mappings'),
 			_('Optional signed DC:IP entries for client destinations missing from the built-in map; a negative DC marks a media address, e.g. -2:203.0.113.10 for DC2 media. These do not change upstream DC overrides.'));
 		o.depends('socks_enabled', '1');
+		o.retain = true;
 		o.validate = function(sectionId, value) {
 			if (!value) return true;
 			const match = value.match(/^(-?(?:[1-5]|203)):(.+)$/);

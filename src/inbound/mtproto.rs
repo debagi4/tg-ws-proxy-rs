@@ -61,11 +61,13 @@ impl Inbound for MtProto {
             return Err(Reject::Drain(reader, writer));
         };
 
-        let dc_idx = if info.is_media {
-            -(info.dc_id as i16)
-        } else {
-            info.dc_id as i16
+        // The index comes back unsigned; -32768 has no positive counterpart
+        // to negate, and names no DC anyway.
+        let Ok(dc) = i16::try_from(info.dc_id) else {
+            debug!("[{}] DC index out of range: {}", label, info.dc_id);
+            return Err(Reject::Close);
         };
+        let dc_idx = if info.is_media { -dc } else { dc };
         Ok(Session {
             reader,
             writer,

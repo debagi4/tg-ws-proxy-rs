@@ -3,7 +3,6 @@
 mod common;
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
@@ -11,7 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use tg_ws_proxy_rs::config::Config;
 use tg_ws_proxy_rs::crypto::{ProtoTag, apply_keystream, generate_relay_init, make_cipher};
 use tg_ws_proxy_rs::inbound::socks;
-use tg_ws_proxy_rs::{pool::WsPool, runtime::Runtime};
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tungstenite::Message;
@@ -23,19 +22,7 @@ fn config() -> Config {
 }
 
 async fn handler(cfg: Config) -> (TcpStream, impl Future<Output = ()> + Send) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client = TcpStream::connect(listener.local_addr().unwrap())
-        .await
-        .unwrap();
-    let (stream, peer) = listener.accept().await.unwrap();
-    let runtime = Arc::new(Runtime::new(cfg.outbound_connector().unwrap()));
-    let pool = Arc::new(WsPool::with_runtime(
-        0,
-        Duration::from_secs(30),
-        runtime.clone(),
-    ));
-    let handler = socks::handle_client(stream, peer, Arc::new(cfg), pool, runtime);
-    (client, handler)
+    common::proxy_connection(cfg, socks::handle_client).await
 }
 
 async fn start(cfg: Config) -> (TcpStream, tokio::task::JoinHandle<()>) {
@@ -71,7 +58,7 @@ async fn greet(client: &mut TcpStream) {
     assert_eq!(read::<2>(client).await, [5, 0]);
 }
 
-async fn request(client: &mut TcpStream, ip: IpAddr, cmd: u8) -> u8 {
+async fn request(client: &mut TcpStream, ip: IpAddr, port: u16, cmd: u8) -> u8 {
     let mut packet = vec![5, cmd, 0];
     match ip {
         IpAddr::V4(ip) => {
@@ -83,7 +70,7 @@ async fn request(client: &mut TcpStream, ip: IpAddr, cmd: u8) -> u8 {
             packet.extend(ip.octets());
         }
     }
-    packet.extend(443u16.to_be_bytes());
+    packet.extend(port.to_be_bytes());
     client.write_all(&packet).await.unwrap();
     let response = read::<10>(client).await;
     assert_eq!(response[0], 5);
@@ -96,17 +83,25 @@ async fn accepts_mapped_ips_and_rejects_auth_udp_bind_unknown_and_domains() {
     client.write_all(&[5, 1, 2]).await.unwrap();
     assert_eq!(read::<2>(&mut client).await, [5, 255]);
     task.await.unwrap();
-    for (ip, cmd, code) in [
-        ("149.154.167.51", 2, 7),
-        ("149.154.167.51", 3, 7),
-        ("127.0.0.1", 1, 2),
-        ("198.18.0.20", 1, 2),
+    for (ip, port, cmd, code) in [
+        ("149.154.167.51", 443, 2, 7),
+        ("149.154.167.51", 443, 3, 7),
+        ("127.0.0.1", 443, 1, 2),
+        ("198.18.0.20", 443, 1, 2),
         // Built into the official clients, so no --socks-dc is needed.
-        ("2001:67c:4e8:f002::a", 1, 0),
+        ("2001:67c:4e8:f002::a", 443, 1, 0),
+        // From a dual-stack socket: still the IPv4 DC2 address.
+        ("::ffff:149.154.167.51", 443, 1, 0),
+        // The port never decides where the bridge connects.
+        ("149.154.167.51", 8443, 1, 0),
     ] {
         let (mut client, task) = start(config()).await;
         greet(&mut client).await;
-        assert_eq!(request(&mut client, ip.parse().unwrap(), cmd).await, code);
+        let reply = request(&mut client, ip.parse().unwrap(), port, cmd).await;
+        assert_eq!(reply, code, "{ip}:{port}");
+        if code != 0 {
+            assert_closed_cleanly(&mut client).await;
+        }
         drop(client);
         task.await.unwrap();
     }
@@ -117,7 +112,19 @@ async fn accepts_mapped_ips_and_rejects_auth_udp_bind_unknown_and_domains() {
         .await
         .unwrap();
     assert_eq!(read::<10>(&mut client).await[1], 4);
+    assert_closed_cleanly(&mut client).await;
     task.await.unwrap();
+}
+
+/// After an error reply the listener must close with FIN: closing with
+/// request bytes still unread sends RST, and a Windows client then drops the
+/// reply it had not read yet.
+async fn assert_closed_cleanly(client: &mut TcpStream) {
+    let mut byte = [0; 1];
+    let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut byte))
+        .await
+        .unwrap();
+    assert!(matches!(read, Ok(0)), "expected FIN, got {read:?}");
 }
 
 #[tokio::test]
@@ -134,7 +141,7 @@ async fn bounds_handshake_time_and_rejects_unsupported_transport() {
     let (mut client, task) = start(config()).await;
     greet(&mut client).await;
     assert_eq!(
-        request(&mut client, "149.154.167.51".parse().unwrap(), 1).await,
+        request(&mut client, "149.154.167.51".parse().unwrap(), 443, 1).await,
         0
     );
     client.write_all(&[0; 64]).await.unwrap();
@@ -267,7 +274,7 @@ async fn roundtrip(proto: ProtoTag, obfuscated: bool, ipv6: bool, packet_framing
     }
     let (mut client, task) = start(cfg).await;
     greet(&mut client).await;
-    assert_eq!(request(&mut client, ip, 1).await, 0);
+    assert_eq!(request(&mut client, ip, 443, 1).await, 0);
     let expected = packets.concat();
     let mut payload = expected.clone();
     let mut decrypt_response = None;

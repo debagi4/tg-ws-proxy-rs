@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -34,8 +34,12 @@ pub fn parse_dc_mapping(value: &str) -> Result<DcMapping, String> {
     if !matches!(dc.unsigned_abs(), 1..=5 | 203) {
         return Err("DC must be 1..5 or 203; use a negative value for media".into());
     }
-    let ip = ip.parse().map_err(|_| "expected an IPv4 or IPv6 address")?;
-    Ok(DcMapping { dc, ip })
+    let ip: IpAddr = ip.parse().map_err(|_| "expected an IPv4 or IPv6 address")?;
+    // Matched against canonical request addresses, like the built-in map.
+    Ok(DcMapping {
+        dc,
+        ip: ip.to_canonical(),
+    })
 }
 
 // Reference for common IPv4 DC/media endpoints:
@@ -45,56 +49,65 @@ pub fn parse_dc_mapping(value: &str) -> Result<DcMapping, String> {
 // media IPv6 addresses only arrive via help.getConfig, so they are not here.
 // Exact destination addresses, not whole Telegram subnets: a subnet may host
 // multiple DCs. Unknown/new/CDN endpoints need an explicit --socks-dc mapping.
-const DC_IPS: &[(i16, &str)] = &[
-    (1, "149.154.175.50"),
-    (1, "149.154.175.51"),
-    (1, "149.154.175.53"),
-    (1, "149.154.175.54"),
-    (-1, "149.154.175.52"),
-    (2, "149.154.167.41"),
-    (2, "149.154.167.50"),
-    (2, "149.154.167.51"),
-    (2, "149.154.167.220"),
-    (2, "95.161.76.100"),
-    (-2, "149.154.167.151"),
-    (-2, "149.154.167.222"),
-    (-2, "149.154.167.223"),
-    (-2, "149.154.162.123"),
-    (3, "149.154.175.100"),
-    (3, "149.154.175.101"),
-    (-3, "149.154.175.102"),
-    (4, "149.154.167.91"),
-    (4, "149.154.167.92"),
-    (-4, "149.154.164.250"),
-    (-4, "149.154.166.120"),
-    (-4, "149.154.166.121"),
-    (-4, "149.154.167.118"),
-    (-4, "149.154.165.111"),
-    (5, "91.108.56.100"),
-    (5, "91.108.56.101"),
-    (5, "91.108.56.116"),
-    (5, "91.108.56.126"),
-    (5, "149.154.171.5"),
-    (-5, "91.108.56.102"),
-    (-5, "91.108.56.128"),
-    (-5, "91.108.56.151"),
-    (203, "91.105.192.100"),
-    (1, "2001:b28:f23d:f001::a"),
-    (2, "2001:67c:4e8:f002::a"),
-    (3, "2001:b28:f23d:f003::a"),
-    (4, "2001:67c:4e8:f004::a"),
-    (5, "2001:b28:f23f:f005::a"),
+const DC_IPS: &[(i16, IpAddr)] = &[
+    (1, v4(149, 154, 175, 50)),
+    (1, v4(149, 154, 175, 51)),
+    (1, v4(149, 154, 175, 53)),
+    (1, v4(149, 154, 175, 54)),
+    (-1, v4(149, 154, 175, 52)),
+    (2, v4(149, 154, 167, 41)),
+    (2, v4(149, 154, 167, 50)),
+    (2, v4(149, 154, 167, 51)),
+    (2, v4(149, 154, 167, 220)),
+    (2, v4(95, 161, 76, 100)),
+    (-2, v4(149, 154, 167, 151)),
+    (-2, v4(149, 154, 167, 222)),
+    (-2, v4(149, 154, 167, 223)),
+    (-2, v4(149, 154, 162, 123)),
+    (3, v4(149, 154, 175, 100)),
+    (3, v4(149, 154, 175, 101)),
+    (-3, v4(149, 154, 175, 102)),
+    (4, v4(149, 154, 167, 91)),
+    (4, v4(149, 154, 167, 92)),
+    (-4, v4(149, 154, 164, 250)),
+    (-4, v4(149, 154, 166, 120)),
+    (-4, v4(149, 154, 166, 121)),
+    (-4, v4(149, 154, 167, 118)),
+    (-4, v4(149, 154, 165, 111)),
+    (5, v4(91, 108, 56, 100)),
+    (5, v4(91, 108, 56, 101)),
+    (5, v4(91, 108, 56, 116)),
+    (5, v4(91, 108, 56, 126)),
+    (5, v4(149, 154, 171, 5)),
+    (-5, v4(91, 108, 56, 102)),
+    (-5, v4(91, 108, 56, 128)),
+    (-5, v4(91, 108, 56, 151)),
+    (203, v4(91, 105, 192, 100)),
+    (
+        1,
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xb28, 0xf23d, 0xf001, 0, 0, 0, 0xa)),
+    ),
+    (
+        2,
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x67c, 0x4e8, 0xf002, 0, 0, 0, 0xa)),
+    ),
+    (
+        3,
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xb28, 0xf23d, 0xf003, 0, 0, 0, 0xa)),
+    ),
+    (
+        4,
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x67c, 0x4e8, 0xf004, 0, 0, 0, 0xa)),
+    ),
+    (
+        5,
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xb28, 0xf23f, 0xf005, 0, 0, 0, 0xa)),
+    ),
 ];
 
-static DC_MAP: LazyLock<Vec<DcMapping>> = LazyLock::new(|| {
-    DC_IPS
-        .iter()
-        .map(|(dc, ip)| DcMapping {
-            dc: *dc,
-            ip: ip.parse().expect("built-in Telegram IP"),
-        })
-        .collect()
-});
+const fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+}
 
 fn destination_dc(ip: IpAddr, config: &Config) -> Option<i16> {
     config
@@ -104,10 +117,10 @@ fn destination_dc(ip: IpAddr, config: &Config) -> Option<i16> {
         .find(|m| m.ip == ip)
         .map(|m| m.dc)
         .or_else(|| {
-            DC_MAP
+            DC_IPS
                 .iter()
-                .find(|mapping| mapping.ip == ip)
-                .map(|mapping| mapping.dc)
+                .find(|(_, known)| *known == ip)
+                .map(|(dc, _)| *dc)
         })
 }
 
@@ -154,8 +167,41 @@ async fn negotiate(stream: &mut TcpStream, config: &Config) -> io::Result<i16> {
         return Err(invalid("SOCKS5 no-auth method required"));
     }
     stream.write_all(&[5, 0]).await?;
+    // Read the whole request before any reply: closing with request bytes
+    // still unread makes the kernel send RST instead of FIN, and a client —
+    // Windows notably — then discards the reply it was about to read.
     let mut request = [0; 4];
     stream.read_exact(&mut request).await?;
+    let host: Option<IpAddr> = match request[3] {
+        1 => {
+            let mut bytes = [0; 4];
+            stream.read_exact(&mut bytes).await?;
+            Some(Ipv4Addr::from(bytes).into())
+        }
+        4 => {
+            let mut bytes = [0; 16];
+            stream.read_exact(&mut bytes).await?;
+            Some(Ipv6Addr::from(bytes).into())
+        }
+        3 => {
+            let len = usize::from(stream.read_u8().await?);
+            let mut bytes = [0; 255];
+            stream.read_exact(&mut bytes[..len]).await?;
+            // Accept an IP encoded as DOMAIN, but do not resolve arbitrary
+            // hostnames or mistake FakeIP for a Telegram DC destination.
+            std::str::from_utf8(&bytes[..len])
+                .ok()
+                .and_then(|s| s.parse().ok())
+        }
+        _ => {
+            // Its length is unknown, so this one cannot be read to the end.
+            reply(stream, 8).await?;
+            return Err(invalid("unsupported SOCKS address type"));
+        }
+    };
+    // Only for logs: the bridge reaches the DC over its own routes, so the
+    // port a client asked for never decides where anything connects.
+    let port = stream.read_u16().await?;
     if request[0] != 5 || request[2] != 0 {
         reply(stream, 1).await?;
         return Err(invalid("invalid SOCKS5 request"));
@@ -164,44 +210,12 @@ async fn negotiate(stream: &mut TcpStream, config: &Config) -> io::Result<i16> {
         reply(stream, 7).await?;
         return Err(invalid("only SOCKS5 CONNECT is supported (no UDP/BIND)"));
     }
-    let ip: IpAddr = match request[3] {
-        1 => {
-            let mut bytes = [0; 4];
-            stream.read_exact(&mut bytes).await?;
-            Ipv4Addr::from(bytes).into()
-        }
-        4 => {
-            let mut bytes = [0; 16];
-            stream.read_exact(&mut bytes).await?;
-            Ipv6Addr::from(bytes).into()
-        }
-        3 => {
-            let len = usize::from(stream.read_u8().await?);
-            let mut bytes = [0; 255];
-            stream.read_exact(&mut bytes[..len]).await?;
-            // Accept an IP encoded as DOMAIN, but do not resolve arbitrary
-            // hostnames or mistake FakeIP for a Telegram DC destination.
-            match std::str::from_utf8(&bytes[..len])
-                .ok()
-                .and_then(|s| s.parse().ok())
-            {
-                Some(ip) => ip,
-                None => {
-                    reply(stream, 4).await?;
-                    return Err(invalid("SOCKS destination must be a mapped Telegram IP"));
-                }
-            }
-        }
-        _ => {
-            reply(stream, 8).await?;
-            return Err(invalid("unsupported SOCKS address type"));
-        }
+    let Some(host) = host else {
+        reply(stream, 4).await?;
+        return Err(invalid("SOCKS destination must be a mapped Telegram IP"));
     };
-    let port = stream.read_u16().await?;
-    if !matches!(port, 80 | 443 | 5222) {
-        reply(stream, 2).await?;
-        return Err(invalid("unsupported Telegram destination port"));
-    }
+    // An IPv4 destination may arrive IPv4-mapped from a dual-stack socket.
+    let ip = host.to_canonical();
     let Some(dc) = destination_dc(ip, config) else {
         if first_report(ip) {
             warn!(

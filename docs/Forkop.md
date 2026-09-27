@@ -128,8 +128,9 @@ address is logged as a warning, and repeats at debug level, since Telegram retri
 a refused DC every few seconds.
 
 Supported: SOCKS5 no-auth CONNECT, IPv4/IPv6 addresses (including IP literals encoded
-as SOCKS DOMAIN), destination ports 80/443/5222, MTProto abridged/intermediate/padded
-intermediate, with or without secretless transport obfuscation. MTProto content
+as SOCKS DOMAIN) on any destination port, MTProto abridged/intermediate/padded
+intermediate, with or without secretless transport obfuscation. The port does not
+matter: the bridge reaches the DC over its own routes. MTProto content
 remains encrypted end-to-end; transport obfuscation is not message encryption.
 
 Not supported: SOCKS UDP ASSOCIATE/BIND, arbitrary DNS names/web browsing,
