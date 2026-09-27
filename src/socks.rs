@@ -6,9 +6,10 @@
 //! using an explicit DC map, then normalize either transport for the shared
 //! upstream ladder. Never silently send an unknown destination over raw TCP.
 
+use std::collections::VecDeque;
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,6 +42,9 @@ pub fn parse_dc_mapping(value: &str) -> Result<DcMapping, String> {
 
 // Reference for common IPv4 DC/media endpoints:
 // https://github.com/AlexMelanFromRingo/tg-proxy/blob/main/src/ip_map.rs
+// IPv6 entries are the production addresses built into both official clients
+// (tdesktop mtproto_dc_options.cpp, Android tgnet ConnectionsManager.cpp);
+// media IPv6 addresses only arrive via help.getConfig, so they are not here.
 // Exact destination addresses, not whole Telegram subnets: a subnet may host
 // multiple DCs. Unknown/new/CDN endpoints need an explicit --socks-dc mapping.
 const DC_IPS: &[(i16, &str)] = &[
@@ -77,6 +81,11 @@ const DC_IPS: &[(i16, &str)] = &[
     (-5, "91.108.56.128"),
     (-5, "91.108.56.151"),
     (203, "91.105.192.100"),
+    (1, "2001:b28:f23d:f001::a"),
+    (2, "2001:67c:4e8:f002::a"),
+    (3, "2001:b28:f23d:f003::a"),
+    (4, "2001:67c:4e8:f004::a"),
+    (5, "2001:b28:f23f:f005::a"),
 ];
 
 static DC_MAP: LazyLock<Vec<DcMapping>> = LazyLock::new(|| {
@@ -102,6 +111,27 @@ fn destination_dc(ip: IpAddr, config: &Config) -> Option<i16> {
                 .find(|mapping| mapping.ip == ip)
                 .map(|mapping| mapping.dc)
         })
+}
+
+/// Unknown destinations already reported at warn level. Telegram retries a
+/// refused DC every few seconds, and one warning per attempt would flush a
+/// router's small log ring. Bounded, so a client cycling through addresses
+/// cannot grow it: an evicted address is merely reported again.
+static REPORTED_UNKNOWN: Mutex<VecDeque<IpAddr>> = Mutex::new(VecDeque::new());
+const REPORTED_UNKNOWN_CAP: usize = 64;
+
+fn first_report(ip: IpAddr) -> bool {
+    let mut reported = REPORTED_UNKNOWN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if reported.contains(&ip) {
+        return false;
+    }
+    if reported.len() == REPORTED_UNKNOWN_CAP {
+        reported.pop_front();
+    }
+    reported.push_back(ip);
+    true
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -175,10 +205,15 @@ async fn negotiate(stream: &mut TcpStream, config: &Config) -> io::Result<i16> {
         return Err(invalid("unsupported Telegram destination port"));
     }
     let Some(dc) = destination_dc(ip, config) else {
-        warn!(
-            "SOCKS destination {}:{} has no DC mapping; configure --socks-dc",
-            ip, port
-        );
+        if first_report(ip) {
+            warn!(
+                "SOCKS destination {}:{} has no DC mapping; configure --socks-dc \
+                 (repeats for this address are logged at debug level)",
+                ip, port
+            );
+        } else {
+            debug!("SOCKS destination {}:{} has no DC mapping", ip, port);
+        }
         reply(stream, 2).await?;
         return Err(invalid("unknown Telegram destination"));
     };
@@ -266,3 +301,6 @@ pub async fn handle_client(
     };
     serve_socks_transport(stream, config, pool, runtime, inbound).await;
 }
+
+#[cfg(test)]
+mod tests;

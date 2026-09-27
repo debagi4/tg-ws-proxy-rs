@@ -90,7 +90,7 @@ async fn request(client: &mut TcpStream, ip: IpAddr, cmd: u8) -> u8 {
 }
 
 #[tokio::test]
-async fn rejects_auth_udp_bind_unknown_destinations_and_domains() {
+async fn accepts_mapped_ips_and_rejects_auth_udp_bind_unknown_and_domains() {
     let (mut client, task) = start(config()).await;
     client.write_all(&[5, 1, 2]).await.unwrap();
     assert_eq!(read::<2>(&mut client).await, [5, 255]);
@@ -100,10 +100,13 @@ async fn rejects_auth_udp_bind_unknown_destinations_and_domains() {
         ("149.154.167.51", 3, 7),
         ("127.0.0.1", 1, 2),
         ("198.18.0.20", 1, 2),
+        // Built into the official clients, so no --socks-dc is needed.
+        ("2001:67c:4e8:f002::a", 1, 0),
     ] {
         let (mut client, task) = start(config()).await;
         greet(&mut client).await;
         assert_eq!(request(&mut client, ip.parse().unwrap(), cmd).await, code);
+        drop(client);
         task.await.unwrap();
     }
     let (mut client, task) = start(config()).await;
