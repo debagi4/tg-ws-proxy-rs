@@ -5,7 +5,9 @@
 			"cgi-io": [ "exec" ],
 			"file": {
 				"/sbin/logread -e tg-ws-proxy-rs": [ "exec" ],
-				"/usr/bin/tg-ws-proxy-rs --print-links *": [ "exec" ]
+				"/usr/bin/tg-ws-proxy-rs --version": [ "exec" ],
+				"/usr/bin/tg-ws-proxy-rs --print-links *": [ "exec" ],
+				"/bin/netstat -lnt": [ "exec" ]
 			},
 			"ubus": {
 				"service": [ "list" ]

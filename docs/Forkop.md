@@ -14,7 +14,7 @@ Telegram (no app proxy) → Forkop / sing-box → 127.0.0.1:1080 SOCKS5
                                             → existing WSS / CF / fallback ladder
 ```
 
-SOCKS input needs **v2.4.6 or newer**, for both the binary and the LuCI package;
+SOCKS input needs **v2.6.0 or newer**, for both the binary and the LuCI package;
 the [one-line installer](../README.md#quick-install-one-liner) upgrades them
 together. Editing UCI on an older installation does not add SOCKS support.
 
