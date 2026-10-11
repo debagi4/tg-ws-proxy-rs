@@ -125,10 +125,21 @@ uci commit tg-ws-proxy-rs
 A negative DC means a media connection. Explicit mappings override the built-in
 map; the last mapping for an IP wins. They identify **client destinations**, unlike
 `--dc-ip`, which changes **upstream** targets. Only add a mapping when you know the
-correct DC; guessing can break authorization or media. Unknown destinations are
-rejected, with no generic direct proxy fallback. The first attempt for each such
-address is logged as a warning, and repeats at debug level, since Telegram retries
-a refused DC every few seconds.
+correct DC; guessing can break authorization or media.
+
+An address missing from both maps is handled by where it is:
+
+- **Inside Telegram's published ranges** ([cidr.txt](https://core.telegram.org/resources/cidr.txt)):
+  the connection is routed by the DC the client's obfuscated transport header names.
+  Telegram Desktop always names it, media included, so new addresses keep working;
+  the first one is logged at info level with the `--socks-dc` line that pins it.
+  A plain transport names no DC, and Android without a proxy secret fills those bytes
+  randomly, so such connections are closed with a warning that media will not load.
+- **Outside them**: refused (`not a Telegram address`), with no generic direct proxy
+  fallback. That is a routing rule sending the wrong traffic here.
+
+Each address is logged once; repeats go to debug level, since Telegram retries a
+refused DC every few seconds.
 
 Supported: SOCKS5 no-auth CONNECT, IPv4/IPv6 addresses (including IP literals encoded
 as SOCKS DOMAIN) on any destination port, MTProto abridged/intermediate/padded
@@ -150,8 +161,12 @@ SOCKS reply alone therefore does not prove that Telegram or WSS works.
 - Forkop should show the client's connection assigned to `telegram_ws`.
 - Proxy logs must show the selected WS/CF route and transferred bytes. A successful
   app session using `TCP fallback` does not prove that the WSS route works.
-- `has no DC mapping`: check the **real destination IP**, then add its known DC mapping.
-  Each address is warned about once; enable debug logs to see every attempt.
+- `missing from the DC map, and its transport names no DC`: add the address with
+  `--socks-dc` (negative DC for media). `routing it as DCn by its transport header` is
+  informational; pinning it with the suggested line is optional.
+- `not a Telegram address`: a routing rule sends non-Telegram traffic here; check the
+  **real destination IP** and the rule set. Each address is logged once; enable debug
+  logs to see every attempt.
 - `unsupported MTProto transport`: enable debug logs; confirm the app proxy is off
   and that the traffic is native MTProto, not HTTPS/MTProxy or a call.
 - Connection storm/zero data: inspect the device filter and outbound exclusions for

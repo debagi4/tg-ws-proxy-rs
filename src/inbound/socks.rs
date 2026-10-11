@@ -3,8 +3,10 @@
 //! SOCKS carries the destination separately from MTProto. Unlike MTProxy,
 //! ordinary clients do not hash their obfuscation key with a proxy secret;
 //! un-obfuscated transports do not carry a DC at all. Resolve the destination
-//! using an explicit DC map, then normalize either transport for the shared
-//! upstream ladder. Never silently send an unknown destination over raw TCP.
+//! using an explicit DC map — or, for a Telegram address the map has not
+//! caught up with, the DC an obfuscated header names — then normalize either
+//! transport for the shared upstream ladder. Never silently send an unknown
+//! destination over raw TCP.
 
 use std::collections::VecDeque;
 use std::io::{self, ErrorKind};
@@ -13,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::{ClientReader, ClientWriter, Inbound, Link, Reject, Session};
 use crate::config::Config;
@@ -31,7 +33,7 @@ pub struct DcMapping {
 pub fn parse_dc_mapping(value: &str) -> Result<DcMapping, String> {
     let (dc, ip) = value.split_once(':').ok_or("expected signed DC:IP")?;
     let dc: i16 = dc.parse().map_err(|_| "invalid DC")?;
-    if !matches!(dc.unsigned_abs(), 1..=5 | 203) {
+    if !is_production_dc(dc) {
         return Err("DC must be 1..5 or 203; use a negative value for media".into());
     }
     let ip: IpAddr = ip.parse().map_err(|_| "expected an IPv4 or IPv6 address")?;
@@ -40,6 +42,11 @@ pub fn parse_dc_mapping(value: &str) -> Result<DcMapping, String> {
         dc,
         ip: ip.to_canonical(),
     })
+}
+
+/// A signed DC index naming a production DC: 1..5 or 203, negative for media.
+fn is_production_dc(dc: i16) -> bool {
+    matches!(dc.unsigned_abs(), 1..=5 | 203)
 }
 
 // Reference for common IPv4 DC/media endpoints:
@@ -74,6 +81,7 @@ const DC_IPS: &[(i16, IpAddr)] = &[
     (-4, v4(149, 154, 166, 121)),
     (-4, v4(149, 154, 167, 118)),
     (-4, v4(149, 154, 165, 111)),
+    (-4, v4(149, 154, 165, 136)),
     (5, v4(91, 108, 56, 100)),
     (5, v4(91, 108, 56, 101)),
     (5, v4(91, 108, 56, 116)),
@@ -81,6 +89,7 @@ const DC_IPS: &[(i16, IpAddr)] = &[
     (5, v4(149, 154, 171, 5)),
     (-5, v4(91, 108, 56, 102)),
     (-5, v4(91, 108, 56, 128)),
+    (-5, v4(91, 108, 56, 147)),
     (-5, v4(91, 108, 56, 151)),
     (203, v4(91, 105, 192, 100)),
     (
@@ -107,6 +116,43 @@ const DC_IPS: &[(i16, IpAddr)] = &[
 
 const fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+}
+
+const fn v6(a: u16, b: u16, c: u16) -> IpAddr {
+    IpAddr::V6(Ipv6Addr::new(a, b, c, 0, 0, 0, 0, 0))
+}
+
+/// Telegram's published address ranges, https://core.telegram.org/resources/cidr.txt.
+/// The exact map above lags behind the addresses `help.getConfig` hands out;
+/// a destination missing from it but inside these is still Telegram, and is
+/// routed by the DC its transport header names.
+const TELEGRAM_RANGES: &[(IpAddr, u8)] = &[
+    (v4(91, 108, 56, 0), 22),
+    (v4(91, 108, 4, 0), 22),
+    (v4(91, 108, 8, 0), 22),
+    (v4(91, 108, 16, 0), 22),
+    (v4(91, 108, 12, 0), 22),
+    (v4(149, 154, 160, 0), 20),
+    (v4(91, 105, 192, 0), 23),
+    (v4(91, 108, 20, 0), 22),
+    (v4(185, 76, 151, 0), 24),
+    (v6(0x2001, 0xb28, 0xf23d), 48),
+    (v6(0x2001, 0xb28, 0xf23f), 48),
+    (v6(0x2001, 0x67c, 0x4e8), 48),
+    (v6(0x2001, 0xb28, 0xf23c), 48),
+    (v6(0x2a0a, 0xf280, 0), 32),
+];
+
+fn is_telegram(ip: IpAddr) -> bool {
+    TELEGRAM_RANGES.iter().any(|&(net, len)| match (net, ip) {
+        (IpAddr::V4(net), IpAddr::V4(ip)) => {
+            u32::from(net) >> (32 - len) == u32::from(ip) >> (32 - len)
+        }
+        (IpAddr::V6(net), IpAddr::V6(ip)) => {
+            u128::from(net) >> (128 - len) == u128::from(ip) >> (128 - len)
+        }
+        _ => false,
+    })
 }
 
 fn destination_dc(ip: IpAddr, config: &Config) -> Option<i16> {
@@ -153,7 +199,10 @@ async fn reply(stream: &mut TcpStream, code: u8) -> io::Result<()> {
     stream.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await
 }
 
-async fn negotiate(stream: &mut TcpStream, config: &Config) -> io::Result<i16> {
+/// Answer the SOCKS request, returning the destination and the DC the map
+/// knows it as. An unmapped Telegram address is accepted with `None`: its DC
+/// can only come from the transport header that follows.
+async fn negotiate(stream: &mut TcpStream, config: &Config) -> io::Result<(IpAddr, Option<i16>)> {
     let mut greeting = [0; 2];
     stream.read_exact(&mut greeting).await?;
     if greeting[0] != 5 {
@@ -216,38 +265,52 @@ async fn negotiate(stream: &mut TcpStream, config: &Config) -> io::Result<i16> {
     };
     // An IPv4 destination may arrive IPv4-mapped from a dual-stack socket.
     let ip = host.to_canonical();
-    let Some(dc) = destination_dc(ip, config) else {
+    let dc = destination_dc(ip, config);
+    if dc.is_none() && !is_telegram(ip) {
         if first_report(ip) {
             warn!(
-                "SOCKS destination {}:{} has no DC mapping; configure --socks-dc \
-                 (repeats for this address are logged at debug level)",
+                "SOCKS destination {}:{} is not a Telegram address; check what the \
+                 router sends here (repeats for this address are logged at debug level)",
                 ip, port
             );
         } else {
-            debug!("SOCKS destination {}:{} has no DC mapping", ip, port);
+            debug!(
+                "SOCKS destination {}:{} is not a Telegram address",
+                ip, port
+            );
         }
         reply(stream, 2).await?;
-        return Err(invalid("unknown Telegram destination"));
-    };
+        return Err(invalid("not a Telegram destination"));
+    }
     // Telegram sends its transport header only after SOCKS CONNECT succeeds.
     // The WSS route is selected once that header reveals the framing protocol.
     reply(stream, 0).await?;
-    Ok(dc)
+    Ok((ip, dc))
 }
 
-/// Read the MTProto transport header that follows CONNECT: its framing, and
-/// the client's obfuscation as `(decrypt, encrypt)` if it is obfuscated.
-async fn read_transport(
-    stream: &mut TcpStream,
-) -> io::Result<(ProtoTag, Option<(AesCtr256, AesCtr256)>)> {
+/// The MTProto transport header that follows CONNECT.
+struct Transport {
+    proto: ProtoTag,
+    /// The client's obfuscation as `(decrypt, encrypt)`, if it is obfuscated.
+    obfuscation: Option<(AesCtr256, AesCtr256)>,
+    /// The production DC an obfuscated header names, if it names one.
+    named_dc: Option<i16>,
+}
+
+async fn read_transport(stream: &mut TcpStream) -> io::Result<Transport> {
+    let plain = |proto| Transport {
+        proto,
+        obfuscation: None,
+        named_dc: None,
+    };
     let mut header = [0; 64];
     stream.read_exact(&mut header[..1]).await?;
     if header[0] == 0xef {
-        return Ok((ProtoTag::Abridged, None));
+        return Ok(plain(ProtoTag::Abridged));
     }
     stream.read_exact(&mut header[1..4]).await?;
     if let Some(proto) = ProtoTag::from_bytes(&header[..4]) {
-        return Ok((proto, None));
+        return Ok(plain(proto));
     }
     stream.read_exact(&mut header[4..]).await?;
     let mut decrypted = header;
@@ -258,9 +321,24 @@ async fn read_transport(
     let proto = ProtoTag::from_bytes(&decrypted[56..60]).ok_or_else(|| {
         invalid("unsupported MTProto transport (HTTP, Full and FakeTLS are not supported)")
     })?;
-    // Without an MTProxy secret the header's DC bytes are not a reliable
-    // routing source. The SOCKS destination is authoritative.
-    Ok((proto, Some(build_raw_ciphers(&header))))
+    // Telegram Desktop writes the signed DC here even without a proxy, but
+    // nothing checks it, and Android fills it randomly without a secret: the
+    // mapped destination stays authoritative, this is only a fallback.
+    let named_dc = i16::from_le_bytes([decrypted[60], decrypted[61]]);
+    Ok(Transport {
+        proto,
+        obfuscation: Some(build_raw_ciphers(&header)),
+        named_dc: is_production_dc(named_dc).then_some(named_dc),
+    })
+}
+
+/// `DC4` or `DC4 media`, as the logs name a signed DC.
+fn dc_label(dc: i16) -> String {
+    format!(
+        "DC{}{}",
+        dc.unsigned_abs(),
+        if dc < 0 { " media" } else { "" }
+    )
 }
 
 fn rejected(peer: SocketAddr, error: io::Error) -> Reject {
@@ -280,19 +358,47 @@ impl Inbound for Socks5 {
         peer: SocketAddr,
         config: &Config,
     ) -> Result<Session, Reject> {
-        let dc_idx = negotiate(&mut stream, config)
+        let (ip, mapped) = negotiate(&mut stream, config)
             .await
             .map_err(|error| rejected(peer, error))?;
-        let (proto, obfuscation) = read_transport(&mut stream)
+        let transport = read_transport(&mut stream)
             .await
             .map_err(|error| rejected(peer, error))?;
+        let dc_idx = match (mapped, transport.named_dc) {
+            (Some(dc), _) => dc,
+            (None, Some(dc)) => {
+                if first_report(ip) {
+                    info!(
+                        "SOCKS destination {} is not in the DC map; routing it as {} by \
+                         its transport header (pin it with --socks-dc {}:{})",
+                        ip,
+                        dc_label(dc),
+                        dc,
+                        ip
+                    );
+                }
+                dc
+            }
+            (None, None) => {
+                if first_report(ip) {
+                    warn!(
+                        "SOCKS destination {} is a Telegram address missing from the DC map, \
+                         and its transport names no DC: these connections fail, often as \
+                         media that never loads. Add its DC with --socks-dc DC:{} \
+                         (negative DC for media)",
+                        ip, ip
+                    );
+                }
+                return Err(rejected(peer, invalid("unmapped Telegram destination")));
+            }
+        };
         let (reader, writer) = stream.into_split();
         Ok(Session {
             reader: ClientReader::Plain(reader),
             writer: ClientWriter::Plain(writer),
             dc_idx,
-            proto,
-            obfuscation,
+            proto: transport.proto,
+            obfuscation: transport.obfuscation,
         })
     }
 

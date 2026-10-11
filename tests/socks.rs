@@ -219,7 +219,31 @@ async fn fake_ws(
     (addr, task)
 }
 
-async fn roundtrip(proto: ProtoTag, obfuscated: bool, ipv6: bool, packet_framing: bool) {
+/// Where a round trip connects, and what the bridge must make of it.
+struct Target {
+    ip: &'static str,
+    mapping: Option<&'static str>,
+    /// The DC an obfuscated client names in its header.
+    header_dc: i16,
+    /// The DC the upstream must see.
+    dc: i16,
+}
+
+/// A mapped address whose header names another DC: the map must win.
+const MAPPED: Target = Target {
+    ip: "149.154.167.51",
+    mapping: None,
+    header_dc: 5,
+    dc: 2,
+};
+const MAPPED_V6: Target = Target {
+    ip: "2001:db8::2",
+    mapping: Some("-2:2001:db8::2"),
+    header_dc: 5,
+    dc: -2,
+};
+
+async fn roundtrip(proto: ProtoTag, obfuscated: bool, target: Target, packet_framing: bool) {
     common::install_rustls_provider();
     let packets: Vec<Vec<u8>> = [b"abcd", b"efgh"]
         .into_iter()
@@ -233,8 +257,8 @@ async fn roundtrip(proto: ProtoTag, obfuscated: bool, ipv6: bool, packet_framing
             packet
         })
         .collect();
-    let dc = if ipv6 { -2 } else { 2 };
-    let (upstream, upstream_task) = fake_ws(dc, proto, packets.clone(), packet_framing).await;
+    let (upstream, upstream_task) =
+        fake_ws(target.dc, proto, packets.clone(), packet_framing).await;
     let mut cfg = Config::try_parse_from([
         "test",
         "--pool-size",
@@ -261,16 +285,9 @@ async fn roundtrip(proto: ProtoTag, obfuscated: bool, ipv6: bool, packet_framing
     ])
     .unwrap()
     .with_defaults();
-    let ip: IpAddr = if ipv6 {
-        "2001:db8::2"
-    } else {
-        "149.154.167.51"
-    }
-    .parse()
-    .unwrap();
-    if ipv6 {
-        cfg.socks_dc
-            .push(socks::parse_dc_mapping("-2:2001:db8::2").unwrap());
+    let ip: IpAddr = target.ip.parse().unwrap();
+    if let Some(mapping) = target.mapping {
+        cfg.socks_dc.push(socks::parse_dc_mapping(mapping).unwrap());
     }
     let (mut client, task) = start(cfg).await;
     greet(&mut client).await;
@@ -279,8 +296,7 @@ async fn roundtrip(proto: ProtoTag, obfuscated: bool, ipv6: bool, packet_framing
     let mut payload = expected.clone();
     let mut decrypt_response = None;
     let mut bytes = if obfuscated {
-        // Intentionally conflicting DC metadata: the SOCKS target must win.
-        let init = generate_relay_init(proto, 5);
+        let init = generate_relay_init(proto, target.header_dc);
         let mut enc = make_cipher(&init[8..40], &init[40..56]);
         apply_keystream(&mut enc, &mut [0; 64]);
         apply_keystream(&mut enc, &mut payload);
@@ -326,8 +342,46 @@ async fn plain_and_obfuscated_transports_roundtrip_through_both_ws_framings() {
     ] {
         for obfuscated in [false, true] {
             for packet_framing in [false, true] {
-                roundtrip(proto, obfuscated, !packet_framing, packet_framing).await;
+                let target = if packet_framing { MAPPED } else { MAPPED_V6 };
+                roundtrip(proto, obfuscated, target, packet_framing).await;
             }
         }
     }
+}
+
+#[tokio::test]
+async fn an_unmapped_telegram_address_is_routed_by_the_dc_its_header_names() {
+    // Inside Telegram's 149.154.160.0/20 but in no map: Telegram Desktop
+    // still names the DC, here DC4 media, in its obfuscated header.
+    let target = Target {
+        ip: "149.154.164.7",
+        mapping: None,
+        header_dc: -4,
+        dc: -4,
+    };
+    roundtrip(ProtoTag::PaddedIntermediate, true, target, false).await;
+}
+
+#[tokio::test]
+async fn an_unmapped_telegram_address_without_a_named_dc_is_closed() {
+    // CONNECT succeeds — the DC can only come from the header — but a plain
+    // transport names none, so the connection is closed rather than guessed.
+    let (mut client, task) = start(config()).await;
+    greet(&mut client).await;
+    let ip = "149.154.164.7".parse().unwrap();
+    assert_eq!(request(&mut client, ip, 443, 1).await, 0);
+    client.write_all(&[0xef, 1, 0, 0, 0, 0]).await.unwrap();
+    // Closed rather than left to the handshake timeout. By RST here, since
+    // the frame after the tag goes unread; unlike a SOCKS error, there is no
+    // reply left for the client to read first.
+    let mut byte = [0; 1];
+    let read = tokio::time::timeout(Duration::from_millis(500), client.read(&mut byte))
+        .await
+        .expect("the connection was left open");
+    let reset = matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset);
+    assert!(
+        matches!(read, Ok(0)) || reset,
+        "expected the connection closed, got {read:?}"
+    );
+    task.await.unwrap();
 }
