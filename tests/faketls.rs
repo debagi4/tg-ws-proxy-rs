@@ -129,6 +129,40 @@ fn server_hello_echoes_the_clients_session_id() {
     );
 }
 
+#[test]
+fn server_hello_never_selects_a_grease_cipher_suite() {
+    // Telegram clients put a GREASE value first; a ServerHello selecting it is
+    // something no real server sends (RFC 8701) and a passive DPI fingerprint.
+    // Record + handshake headers, version, random, session id length + 32 bytes.
+    const CLIENT_SUITES_OFFSET: usize = 5 + 4 + 2 + 32 + 1 + 32 + 2;
+    const SERVER_SUITE_OFFSET: usize = 5 + 4 + 2 + 32 + 1 + 32;
+    let secret = [0x88; 16];
+    let cases: [(&[[u8; 2]], [u8; 2]); 2] = [
+        // GREASE replaces 0x1301, so the client's first real TLS 1.3 suite is 0x1302.
+        (&[[0x7a, 0x7a]], [0x13, 0x02]),
+        // No TLS 1.3 suite offered at all: fall back to TLS_AES_128_GCM_SHA256.
+        (&[[0x0a, 0x0a], [0xc0, 0x2b], [0xc0, 0x2f]], [0x13, 0x01]),
+    ];
+
+    for (leading_suites, expected) in cases {
+        let mut client_hello = build_faketls_client_hello("www.yandex.ru");
+        for (i, suite) in leading_suites.iter().enumerate() {
+            let at = CLIENT_SUITES_OFFSET + 2 * i;
+            client_hello[at..at + 2].copy_from_slice(suite);
+        }
+        sign_faketls_client_hello(&mut client_hello, &secret);
+        let parsed = parse_faketls_client_hello(&client_hello, &secret).unwrap();
+
+        let server_hello = build_faketls_server_hello(&secret, &parsed);
+
+        assert_eq!(
+            server_hello[SERVER_SUITE_OFFSET..SERVER_SUITE_OFFSET + 2],
+            expected,
+            "client suites starting with {leading_suites:02x?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn application_data_records_round_trip() {
     // Everything after the handshake is wrapped in TLS Application Data
