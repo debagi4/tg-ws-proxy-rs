@@ -595,6 +595,7 @@ pub fn cf_worker_path(dst: &str, dc: u32, is_media: bool) -> String {
 }
 
 /// Try all domains for a DC in order; return the first success or the last error.
+/// A TCP connect that times out ends the walk: every domain shares the address.
 ///
 /// Returns `(Some(stream), all_redirects)`:
 /// - `all_redirects = true` when every domain returned a redirect (WS is
@@ -683,6 +684,13 @@ pub async fn connect_ws_for_dc_with_outbound(
 
                 all_redirects = false;
                 any_connect_timed_out = true;
+
+                // Every record is dialled at the same `ip` — the hostname only
+                // reaches the SNI and Host header, after the TCP connect.  A
+                // connect that ran out the clock would run it out again for
+                // the next record, so the second attempt only doubled what a
+                // client waits before the fallback chain gets a turn (#148).
+                break;
             }
         }
     }
