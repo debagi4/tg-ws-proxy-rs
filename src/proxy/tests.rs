@@ -296,3 +296,174 @@ async fn a_worker_tunnel_never_emits_an_oversized_frame() {
         "every byte the client sent has to reach the upstream: {sizes:?}"
     );
 }
+
+// ─── A pinned ladder and a cooled `--dc-ip` ──────────────────────────────────
+
+// `WS_FAIL` and `IP_FAIL` are process-global maps shared by every test in this
+// binary, so each ladder test uses its own DC number (non-canonical test DCs)
+// and its own IP address to prevent concurrent runs in libtest from wiping each
+// other's state.
+const LADDER_DC_STEP_OVER: u32 = 201;
+const LADDER_IP_STEP_OVER: &str = "192.0.2.10"; // RFC 5737
+
+const LADDER_DC_NO_LATER_RUNG: u32 = 202;
+const LADDER_IP_NO_LATER_RUNG: &str = "192.0.2.11";
+
+const LADDER_DC_RE_PROBE: u32 = 203;
+const LADDER_IP_RE_PROBE: &str = "192.0.2.12";
+
+fn ladder_config(extra: &[&str]) -> Config {
+    let mut args = vec![
+        "tg-ws-proxy",
+        "--secret",
+        "00112233445566778899aabbccddeeff",
+        // A dial to a blackholed address has to be bounded by the test, not by
+        // the default ten seconds.
+        "--ws-connect-timeout",
+        "1",
+        "--pool-size",
+        "0",
+        "--no-outbound-proxy",
+    ];
+    args.extend_from_slice(extra);
+    Config::try_parse_from(args).unwrap()
+}
+
+fn ladder_route<'a>(
+    config: &'a Config,
+    runtime: &'a Runtime,
+    pool: &'a Arc<WsPool>,
+    dc: u32,
+) -> Route<'a> {
+    Route {
+        label: "127.0.0.1:1".parse().unwrap(),
+        config,
+        runtime,
+        pool,
+        timeouts: Timeouts::from_config(config),
+        dc,
+        is_media: false,
+        media: media_tag(false),
+        dc_idx: dc as i16,
+        proto: ProtoTag::Intermediate,
+    }
+}
+
+#[tokio::test]
+async fn a_pinned_ladder_steps_over_a_cooled_dc_ip() {
+    // A pin replaces the default ladder, and the cooldown skip lives in the
+    // default ladder.  Without it here, `--pinned-upstream ws,…` re-dials an
+    // address that has already timed out on every cold-pool client, and each of
+    // those waits out `--ws-connect-timeout` once per `kws` record before the
+    // pin's next rung gets a turn.
+    let config = ladder_config(&[]);
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        Arc::clone(&runtime),
+    ));
+    let route = ladder_route(&config, &runtime, &pool, LADDER_DC_STEP_OVER);
+    let ws_fail_key = (LADDER_DC_STEP_OVER, false);
+
+    WS_FAIL.clear(&ws_fail_key);
+    IP_FAIL.set(LADDER_IP_STEP_OVER.to_string(), Duration::from_secs(60));
+
+    let upstream = route
+        .pinned_ladder(
+            &[UpstreamTier::Ws, UpstreamTier::Tcp],
+            Some(LADDER_IP_STEP_OVER),
+        )
+        .await;
+
+    // A dial is what arms `WS_FAIL`, so leaving it clear is proof that the
+    // cooled address never reached the connector -- the same signal the log's
+    // "skipping direct WS" line carries, without needing a network.
+    let dialled_the_cooled_ip = WS_FAIL.active(&ws_fail_key);
+    IP_FAIL.clear(LADDER_IP_STEP_OVER);
+
+    assert!(
+        matches!(upstream, Some(Upstream::Tcp(_))),
+        "the rung after the skipped one is the one that connects"
+    );
+    assert!(
+        !dialled_the_cooled_ip,
+        "the pinned ladder dialled the cooled {LADDER_IP_STEP_OVER} again"
+    );
+}
+
+#[tokio::test]
+async fn a_pin_with_no_later_rung_dials_its_cooled_dc_ip_anyway() {
+    // Stepped over, not written off: the cooldown is worth honouring only while
+    // a later rung can connect.  A `ws`-only pin has no later rung, so the
+    // cooled address is the client's only way out, and the doomed attempt beats
+    // dropping the connection.
+    let config = ladder_config(&[]);
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        Arc::clone(&runtime),
+    ));
+    let route = ladder_route(&config, &runtime, &pool, LADDER_DC_NO_LATER_RUNG);
+    let ws_fail_key = (LADDER_DC_NO_LATER_RUNG, false);
+
+    WS_FAIL.clear(&ws_fail_key);
+    IP_FAIL.set(LADDER_IP_NO_LATER_RUNG.to_string(), Duration::from_secs(60));
+
+    let upstream = route
+        .pinned_ladder(&[UpstreamTier::Ws], Some(LADDER_IP_NO_LATER_RUNG))
+        .await;
+
+    let dialled_the_cooled_ip = WS_FAIL.active(&ws_fail_key);
+    WS_FAIL.clear(&ws_fail_key);
+    IP_FAIL.clear(LADDER_IP_NO_LATER_RUNG);
+
+    assert!(upstream.is_none(), "a pin has nothing to fall back to");
+    assert!(
+        dialled_the_cooled_ip,
+        "the only rung was skipped, which leaves the client nowhere to go"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_ladder_re_probes_a_cooled_dc_ip_when_every_rung_fails() {
+    // The other half of the rule: a skip must not become a dead end for the
+    // rest of the cooldown.  An `--mtproto-proxy` on a closed local port fails
+    // without a network the way a dead upstream does, so the last thing the
+    // ladder has left is the address it stepped over — and asking it is what
+    // keeps the cooldown self-healing, since only a successful direct connect
+    // clears it.
+    let config = ladder_config(&[
+        "--mtproto-proxy",
+        "127.0.0.1:1:00112233445566778899aabbccddeeff",
+    ]);
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        Arc::clone(&runtime),
+    ));
+    let route = ladder_route(&config, &runtime, &pool, LADDER_DC_RE_PROBE);
+    let ws_fail_key = (LADDER_DC_RE_PROBE, false);
+
+    WS_FAIL.clear(&ws_fail_key);
+    IP_FAIL.set(LADDER_IP_RE_PROBE.to_string(), Duration::from_secs(60));
+
+    let upstream = route
+        .pinned_ladder(
+            &[UpstreamTier::Ws, UpstreamTier::Mtproto],
+            Some(LADDER_IP_RE_PROBE),
+        )
+        .await;
+
+    let re_probed_the_cooled_ip = WS_FAIL.active(&ws_fail_key);
+    WS_FAIL.clear(&ws_fail_key);
+    IP_FAIL.clear(LADDER_IP_RE_PROBE);
+
+    assert!(upstream.is_none(), "nothing in the pin can connect");
+    assert!(
+        re_probed_the_cooled_ip,
+        "the cooled address was never asked again, so nothing can clear it"
+    );
+}

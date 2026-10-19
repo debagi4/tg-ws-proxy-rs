@@ -378,3 +378,42 @@ fn no_domains_means_no_attempts() {
 
     assert_eq!(attempts.next_domain(), None);
 }
+
+#[tokio::test]
+async fn a_connect_timeout_is_not_repeated_for_the_second_record() {
+    // Both `kws{N}` records are dialled at the same address, so once its TCP
+    // connect has run out the clock the other record can only run it out
+    // again — which is what made a cold direct tier cost twice the connect
+    // timeout before any fallback (#148).  An outbound proxy that accepts and
+    // never answers turns each dial into an observable, network-free stall.
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let dials = Arc::new(AtomicUsize::new(0));
+    let accepted = Arc::clone(&dials);
+    let proxy_task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (stream, _) = proxy.accept().await.unwrap();
+            accepted.fetch_add(1, AtomicOrdering::SeqCst);
+            held.push(stream);
+        }
+    });
+
+    let outbound =
+        OutboundConnector::from_config(Some(&format!("http://{proxy_addr}")), None, false).unwrap();
+    let attempt = connect_ws_for_dc_with_outbound(
+        "192.0.2.1",
+        2,
+        false,
+        false,
+        Duration::from_millis(200),
+        &outbound,
+        None,
+    )
+    .await;
+    proxy_task.abort();
+
+    assert!(attempt.ws.is_none());
+    assert!(attempt.connect_timed_out);
+    assert_eq!(dials.load(AtomicOrdering::SeqCst), 1);
+}

@@ -563,6 +563,11 @@ impl Route<'_> {
     /// fails, the connection is dropped: pinning is opt-in, so tiers the user
     /// left out are not quietly re-added as fallbacks.
     ///
+    /// A cooled `--dc-ip` address follows the default ladder's two-step rule
+    /// here as well: the `ws` rung steps over it while a later rung can still
+    /// connect, and comes back for it once every rung has failed — see the
+    /// ip-cooling block of `select_upstream`, which the default ladder uses.
+    ///
     /// The one departure from the default cooldown behavior is on the last
     /// tier that can still connect: the Worker and upstream-MTProto rungs
     /// dial through their cooldown there instead of skipping.  In the default
@@ -575,6 +580,12 @@ impl Route<'_> {
         tiers: &[UpstreamTier],
         target_ip: Option<&str>,
     ) -> Option<Upstream> {
+        // A pinned ladder *replaces* the default one, so it has to carry the
+        // same two rules about a cooled `--dc-ip` address that `select_upstream`
+        // applies: step over it (otherwise every cold-pool client waits out
+        // `--ws-connect-timeout`, twice — once per `kws` record), and come back
+        // for it when every other pinned rung has failed.
+        let mut cooled_ws = None;
         for (index, tier) in tiers.iter().enumerate() {
             let last_resort = !self.tier_attemptable_after(tiers, index + 1, target_ip);
             match tier {
@@ -586,6 +597,18 @@ impl Route<'_> {
                         );
                         continue;
                     };
+                    // Only worth skipping while a later rung can still connect;
+                    // as the last rung this address is the client's only way
+                    // out, and the doomed attempt beats dropping the client.
+                    if !last_resort && IP_FAIL.active(target_ip) {
+                        let reason = "IP in cooldown";
+                        info!(
+                            "[{}] DC{}{} {} → skipping direct WS to {}",
+                            self.label, self.dc, self.media, reason, target_ip
+                        );
+                        cooled_ws = Some(target_ip);
+                        continue;
+                    }
                     if let Some(upstream) = self.direct_ws_tier(target_ip).await {
                         return Some(upstream);
                     }
@@ -628,6 +651,21 @@ impl Route<'_> {
                     };
                     return Some(self.tcp_fallback(dst, "pinned"));
                 }
+            }
+        }
+
+        // Stepped over, not written off: a direct connect is the only thing
+        // that clears the cooldown, so something has to keep asking.  Every
+        // pinned rung has now failed, which makes this the last chance — the
+        // raw TCP rung the default ladder would leave the client on is not
+        // reached from here, a pin dials exactly what it lists.
+        if let Some(target_ip) = cooled_ws {
+            info!(
+                "[{}] DC{}{} every pinned fallback failed → re-probing {}",
+                self.label, self.dc, self.media, target_ip
+            );
+            if let Some(upstream) = self.direct_ws_tier(target_ip).await {
+                return Some(upstream);
             }
         }
 

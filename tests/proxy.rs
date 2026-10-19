@@ -592,8 +592,8 @@ async fn fronting_domain_is_applied_from_the_first_attempt() {
     // SNI times out" round-trip leaks telegram.org to a network that RSTs it
     // on sight. Observable through the outbound proxy as the attempt count:
     // the old reactive path dialed the DC IP with the real SNI and then once
-    // more fronted after the handshake stalled; fronted-first dials exactly
-    // once per hostname variant and moves on down the ladder.
+    // more fronted after the handshake stalled; fronted-first dials once, and
+    // the stalled connect also ends the hostname walk (#148).
     const DC_IP: &str = "149.154.167.220";
     let (proxy_addr, proxy_task) = stalling_http_proxy_requests(DC_IP).await;
     let config = proxy_config(
@@ -618,8 +618,8 @@ async fn fronting_domain_is_applied_from_the_first_attempt() {
         .filter(|target| **target == format!("{DC_IP}:443"))
         .count();
     assert_eq!(
-        dc_dials, 2,
-        "expected exactly the two hostname variants with no reactive retry, got {requests:?}"
+        dc_dials, 1,
+        "expected a single dial with no reactive retry, got {requests:?}"
     );
 }
 
@@ -661,8 +661,8 @@ async fn a_dc_ip_that_timed_out_is_skipped_on_the_next_connection() {
     assert_eq!(
         connect_targets(&requests),
         [
-            // First connection probes the DC IP on both Telegram hostnames...
-            DEAD_IP,
+            // First connection probes the DC IP once — the second hostname
+            // shares the address, so its connect would stall the same way...
             DEAD_IP,
             // ...then falls back to the Worker and finally to TCP.
             "worker-ipfail.example.dev:443",
@@ -671,7 +671,6 @@ async fn a_dc_ip_that_timed_out_is_skipped_on_the_next_connection() {
             "worker-ipfail.example.dev:443",
             // ...and only re-probes it because nothing else was left, on the
             // short cooldown clock rather than the full connect timeout.
-            DEAD_IP,
             DEAD_IP,
             "149.154.175.100:443",
         ]
